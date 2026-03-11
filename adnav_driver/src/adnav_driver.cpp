@@ -207,30 +207,10 @@ void Driver::createPublishers() {
  * @brief Function to declare and assign callbacks to services for the adnav_driver node.
  */
 void Driver::createServices() {
-	packet_period_srv_ = this->create_service<adnav_interfaces::srv::PacketPeriods>(
-		"~/packet_periods",
-		std::bind(
-			&Driver::srvPacketPeriods,
-			this,
-			std::placeholders::_1,
-			std::placeholders::_2),
-		rclcpp::ServicesQoS(),
-		service_group_);
-
 	packet_period_timer_srv_ = this->create_service<adnav_interfaces::srv::PacketTimerPeriod>(
 		"~/packet_timer_period",
 		std::bind(
 			&Driver::srvPacketTimerPeriod,
-			this,
-			std::placeholders::_1,
-			std::placeholders::_2),
-		rclcpp::ServicesQoS(),
-		service_group_);
-
-	request_packet_srv_ = this->create_service<adnav_interfaces::srv::RequestPackets>(
-		"~/request_packet",
-		std::bind(
-			&Driver::srvRequestPackets,
 			this,
 			std::placeholders::_1,
 			std::placeholders::_2),
@@ -755,30 +735,6 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 //~~~~~~ Service Functions
 
 /**
- * @brief Service to update the Packet Periods from the device.
- *
- * Communicates to the device and receives an acknowledgement packet.
- *
- * @param request Const shared pointer to a PacketPeriods request.
- * @param response Shared pointer to a PacketPeriods response.
- */
-void Driver::srvPacketPeriods(const std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Request> request,
-		std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Response> response) {
-
-	// Send Config to device
-	SendPacketPeriods(request->periods, request->clear_existing_periods);
-
-	// Await the response
-	response->acknowledgement = AcknowledgeHandler();
-
-	// notify of result.
-	char buf[15];
-	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
-	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
-            response->acknowledgement.crc, (response->acknowledgement.result == 0) ? "Success\n":buf);
-}
-
-/**
  * @brief Service to request a change of Packet Timer Period from the device.
  *
  * @param request Const shared pointer to a PacketTimerPeriod Request msg
@@ -798,28 +754,6 @@ void Driver::srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::P
 	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
 	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
             response->acknowledgement.crc, (response->acknowledgement.result == 0) ? "Success\n":buf);
-}
-
-/**
- * @brief Service to request a series of packets from the device.
- *
- * @param request Const shared pointer to a RequestPackets Request msg
- * @param response Shared pointer to a RequestPackets Response.
- */
-void Driver::srvRequestPackets(const std::shared_ptr<adnav_interfaces::srv::RequestPackets::Request> request,
-		std::shared_ptr<adnav_interfaces::srv::RequestPackets::Response> response) {
-
-	an_packet_t *an_packet;
-
-	RCLCPP_INFO(this->get_logger(), "Incoming Packet Request:");
-
-	for(auto& i : request->packet_ids) {
-		RCLCPP_INFO(this->get_logger(), "Requesting ID: %d", i);
-		an_packet = encode_request_packet(i);
-		encodeAndSend(an_packet);
-	}
-
-	response->success = true;
 }
 
 void Driver::srvNtrip(const std::shared_ptr<adnav_interfaces::srv::Ntrip::Request> request,
@@ -1490,7 +1424,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
  * @brief Function to send the packet Timer to the device and await the acknowledgement.
  *
  * @param packet_timer_period Period for the packet rates in microseconds.
- * @param UTC_sync Synchronize with UTC time. True by default.
+ * @param utc_sync Synchronize with UTC time. True by default.
  * @param permanent Is this a permanent change. True by default.
  * @return acknowledgement Message
  */

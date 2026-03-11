@@ -223,11 +223,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::chrono::microseconds read_timer_interval_;
 
     // Service Handlers
-    rclcpp::Service<adnav_interfaces::srv::PacketPeriods>::SharedPtr packet_period_srv_;
     rclcpp::Service<adnav_interfaces::srv::PacketTimerPeriod>::SharedPtr packet_period_timer_srv_;
     rclcpp::Service<std_srvs::srv::Empty>::SharedPtr restart_pub_srv_;
     rclcpp::Service<std_srvs::srv::Empty>::SharedPtr restart_read_srv_;
-    rclcpp::Service<adnav_interfaces::srv::RequestPackets>::SharedPtr request_packet_srv_;
     rclcpp::Service<adnav_interfaces::srv::Ntrip>::SharedPtr ntrip_srv_;
 
     // Threading variables
@@ -264,17 +262,12 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void RestartReader();
 
     //~~~~~~ Logging Functions
-    void openLogFile();
     void system_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
     void filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
 
     //~~~~~~ ROS Services
-    void srvPacketPeriods(const std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Request> request,
-            std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Response> response);
     void srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Request> request,
             std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Response> response);
-    void srvRequestPackets(const std::shared_ptr<adnav_interfaces::srv::RequestPackets::Request> request,
-        std::shared_ptr<adnav_interfaces::srv::RequestPackets::Response> response);
     void srvNtrip(const std::shared_ptr<adnav_interfaces::srv::Ntrip::Request> request,
         std::shared_ptr<adnav_interfaces::srv::Ntrip::Response> response);
 
@@ -290,7 +283,6 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void updatePacketRequest(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePacketTimer(const rclcpp::Parameter& parameter);
     void updatePacketTimer(const rclcpp::Parameter& parameter);
-    void validateAndSaveIPAddress(const rclcpp::Parameter& parameter);
 
     //~~~~~~ NTRIP Functions
     void updateNTRIPClientService();
