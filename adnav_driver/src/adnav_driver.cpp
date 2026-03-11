@@ -150,12 +150,12 @@ void Driver::waitForDevicePacket() {
 		// Decode all data and act on only the device info data.
 		if (bytes_received > 0)
 		 {
-			anpp_logger_.writeAndIncrement((char*) an_decoder_pointer(&an_decoder), bytes_received);
+			anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), bytes_received);
 
 			// Increment the decode buffer length by the number of bytes received
 			an_decoder_increment(&an_decoder, bytes_received);
 
-			while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
+			while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
 			 {
 				RCLCPP_DEBUG(this->get_logger(), "[WaitForDevicePacket]ID: %d", an_packet->id);
 
@@ -196,6 +196,7 @@ void Driver::createPublishers() {
 	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>("~/temperature", 10);
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("~/twist", 10);
 	twist_stamped_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("~/twist_stamped", 10);
+	twist_stamped_external_body_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("~/twist_stamped_external_body", 10);
 	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("~/pose", 10);
 	pose_stamped_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("~/pose_stamped", 10);
 	geo_pose_pub_ = this->create_publisher<geographic_msgs::msg::GeoPose>("~/geopose", 10);
@@ -582,6 +583,7 @@ void Driver::publishTimerCallback() {
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
 	twist_pub_->publish(twist_msg_);
 	twist_stamped_pub_->publish(twist_stamped_msg_);
+	twist_stamped_external_body_pub_->publish(twist_stamped_msg_external_body);
 	imu_pub_->publish(imu_msg_);
 	imu_raw_pub_->publish(imu_raw_msg_);
 	magnetic_field_pub_->publish(mag_field_msg_);
@@ -1604,6 +1606,14 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
+			case packet_id_body_velocity:
+				bodyVelRosDecoder(an_packet);
+				break;
+
+			case packet_id_external_body_velocity:
+				extBodyVelRosDecoder(an_packet);
+				break;
+
 			default:
 				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
 					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
@@ -1943,4 +1953,45 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
 	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);
 }
+
+void Driver::bodyVelRosDecoder(an_packet_t *an_packet)
+{
+	body_velocity_packet_t body_velocity_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+	// Debug timekeeper
+	auto stamp_time = this->get_clock().get()->now();
+
+	if (decode_body_velocity_packet(&body_velocity_packet, an_packet) == 0)
+	{
+		twist_msg_.linear.x = body_velocity_packet.velocity[0];
+		twist_msg_.linear.y = -body_velocity_packet.velocity[1];
+		twist_msg_.linear.z = -body_velocity_packet.velocity[2];
+		twist_stamped_msg_.header.stamp = stamp_time;
+		twist_stamped_msg_.header.frame_id = frame_id_;
+		twist_stamped_msg_.twist = twist_msg_;
+	}
+	// Now that work is complete notify an update for the publisher.
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+void Driver::extBodyVelRosDecoder(an_packet_t *an_packet)
+{
+	external_body_velocity_packet_t external_body_velocity_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+	// Debug timekeeper
+	auto stamp_time = this->get_clock().get()->now();
+
+	if (decode_external_body_velocity_packet(&external_body_velocity_packet, an_packet) == 0)
+	{
+		twist_stamped_msg_external_body.twist.linear.x = external_body_velocity_packet.velocity[0];
+		twist_stamped_msg_external_body.twist.linear.y = -external_body_velocity_packet.velocity[1];
+		twist_stamped_msg_external_body.twist.linear.z = -external_body_velocity_packet.velocity[2];
+		twist_stamped_msg_external_body.header.stamp = stamp_time;
+		twist_stamped_msg_external_body.header.frame_id = external_frame_id_;
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
 }// namespace adnav

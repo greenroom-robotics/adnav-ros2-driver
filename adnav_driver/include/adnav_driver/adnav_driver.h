@@ -176,10 +176,12 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     sensor_msgs::msg::Temperature   temp_msg_;
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::TwistStamped twist_stamped_msg_;
+    geometry_msgs::msg::TwistStamped twist_stamped_msg_external_body;
     geometry_msgs::msg::PoseStamped pose_stamped_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
     geographic_msgs::msg::GeoPose   geo_pose_msg_;
     geographic_msgs::msg::GeoPoseStamped geo_pose_stamped_msg_;
+
 
     std::shared_ptr<diagnostic_updater::Updater> diagnostic_updater_;
 
@@ -192,6 +194,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr 			twist_stamped_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr 			twist_stamped_external_body_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr 			pose_stamped_pub_;
     rclcpp::Publisher<geographic_msgs::msg::GeoPose>::SharedPtr 			geo_pose_pub_;
@@ -310,6 +313,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void ecefPosRosDecoder(an_packet_t* an_packet);
     void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
+    void extBodyVelRosDecoder(an_packet_t *an_packet);
+    void bodyVelRosDecoder(an_packet_t *an_packet);
 };
 
 }  // namespace adnav
