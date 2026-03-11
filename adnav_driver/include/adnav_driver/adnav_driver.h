@@ -51,6 +51,8 @@
 #include <adnav_logger.h>
 #include <adnav_ntrip.h>
 
+#include <adnav_driver/adnav_parameters.hpp>
+
 // Adnav_interfaces
 #include <adnav_interfaces/srv/packet_periods.hpp>
 #include <adnav_interfaces/srv/packet_timer_period.hpp>
@@ -139,25 +141,16 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Debug variables
     int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P27_num_ = 0, P33_num_ = 0, P0_num_ = 0;
 
-    // Defines what communication method to use, refer to adnav_driver_connection_e.
-    int communication_state_;
+    std::shared_ptr<adnav::ParamListener> param_listener_;
 
     // String to hold frame_id
     std::string frame_id_ = "imu_link";
-
-    // Whether to convert twist from ENU to FLU
-    bool convert_twist_enu_to_flu_ = false;
+    std::string external_frame_id_ = "map";
 
     // device communication settings
     std::unique_ptr<adnav::Communicator> communicator_;
-    adnav_connections_data_t comms_data_;
-
-    // Packet settings;
-    std::vector<int64_t> packet_request_;
-    int packet_timer_period_;
 
     // Log files.
-    std::string log_path_;
     adnav::Logger anpp_logger_;
     adnav::Logger rtcm_logger_;
 
@@ -218,9 +211,6 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Timers
     rclcpp::TimerBase::SharedPtr publish_timer_;
     rclcpp::TimerBase::SharedPtr read_timer_;
-    // Timer intervals
-    std::chrono::microseconds publish_timer_interval_;
-    std::chrono::microseconds read_timer_interval_;
 
     // Service Handlers
     rclcpp::Service<adnav_interfaces::srv::PacketTimerPeriod>::SharedPtr packet_period_timer_srv_;
@@ -253,7 +243,6 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void createServices();
     void deviceSetup();
     void setupParamService();
-    void setupParams();
 
     //~~~~~~ Control Functions
     void recievePackets();
@@ -272,6 +261,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
         std::shared_ptr<adnav_interfaces::srv::Ntrip::Response> response);
 
     //~~~~~~ Parameter Functions
+    std::vector<adnav_interfaces::msg::PacketPeriod> getPacketRequest();
     rcl_interfaces::msg::SetParametersResult ParamSetCallback(const std::vector<rclcpp::Parameter>& Params);
     rcl_interfaces::msg::SetParametersResult validateBaudRate(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validateComPort(const rclcpp::Parameter& parameter);

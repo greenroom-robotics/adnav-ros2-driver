@@ -55,23 +55,34 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	diagnostic_updater_ = std::make_shared<diagnostic_updater::Updater>(this);
 
 	// Setup parameters for the node
+	param_listener_ = std::make_shared<adnav::ParamListener>(this);
 	setupParamService();
 
 	// Create timers for callbacks
+	const auto params = param_listener_->get_params();
+	// Reset the timer using the class stored interval.
 	publish_timer_ = this->create_wall_timer(
-      	publish_timer_interval_ , std::bind(&Driver::publishTimerCallback, this), publishing_group_);
+		std::chrono::microseconds(params.publish_us), std::bind(&Driver::publishTimerCallback, this),
+		publishing_group_);
 
 	read_timer_ = this->create_wall_timer(
-		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
+		std::chrono::microseconds(params.read_us), std::bind(&Driver::recievePackets, this), reading_group_);
 
 	// Setup Services for the node
 	createServices();
 
 	// Open a new ANPP Log file for data logging
-	anpp_logger_.openFile("Log_", ".anpp", log_path_);
+	anpp_logger_.openFile("Log_", ".anpp", params.log_path);
 
 	// Open Communications with the device
-	communicator_ = std::make_unique<adnav::Communicator>(comms_data_);
+
+	adnav_connections_data_t comms_data {};
+	comms_data.method = params.comm_select;
+	comms_data.com_port = params.com_port;
+	comms_data.ip_address = params.ip_address;
+	comms_data.port = params.port;
+
+	communicator_ = std::make_unique<adnav::Communicator>(comms_data);
 	communicator_->open();
 
 	// Request device info with Packet 1 and 3
@@ -86,7 +97,7 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	diagnostic_updater_->add("System Status", this, &Driver::system_status_diagnostic);
 	diagnostic_updater_->add("Filter Status", this, &Driver::filter_status_diagnostic);
 
-	RCLCPP_INFO(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
+	RCLCPP_DEBUG(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
 }
 
 /**
@@ -95,7 +106,7 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
  * Closes the Logfiles and gives name to the user. Shutsdown the communication method
  */
 Driver::~Driver() {
-	RCLCPP_INFO(this->get_logger(), "Deconstructing Adnav_Driver node");
+	RCLCPP_DEBUG(this->get_logger(), "Deconstructing Adnav_Driver node");
 
 	anpp_logger_.closeFile();
 
@@ -228,31 +239,18 @@ void Driver::createServices() {
 		service_group_);
 }
 
-/**
- * @brief Method to push requested configuration to the device.
- *
- * This method will take stored data on the configurationand form configuration packets which
- * will then be pushed to the device.
- */
 void Driver::deviceSetup() {
 	RCLCPP_INFO(this->get_logger(), "Sending requested configuration to device:");
 
+	const auto params = param_listener_->get_params();
+
 	// Create and send a Packet Timer Period Packet.
 	acknowledge_recieve_ = true; // Since we are not waiting for device acknowledgement at startup
-	(void)SendPacketTimer(packet_timer_period_); // Will overwrite acknowledge_receive_ to false
-
-	// Create and fill a periods format.
-	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
-	for(uint64_t i = 0; (i+i) < packet_request_.size(); i++) {
-		adnav_interfaces::msg::PacketPeriod period;
-		period.packet_id = packet_request_[i+i];
-		period.packet_period = packet_request_[i+i+1];
-		packet_periods.push_back(period);
-	}
+	SendPacketTimer(params.packet_timer_period); // Will overwrite acknowledge_receive_ to false
 
 	// Since we are not waiting for device acknowledgement at startup
 	acknowledge_recieve_ = true;
-	(void)SendPacketPeriods(packet_periods); // Will overwrite acknowledge_receive_ to false.
+	SendPacketPeriods(getPacketRequest()); // Will overwrite acknowledge_receive_ to false.
 }
 
 /**
@@ -263,10 +261,6 @@ void Driver::deviceSetup() {
  * Will assign a default value if one is not provided already.
  */
 void Driver::setupParamService() {
-
-	// Setup and validate launch parameters.
-	setupParams();
-
 	// Register the callback for parameter changes.
 	// Will be called whenever a parameter is update is requested.
 	param_set_cb_ = this->add_on_set_parameters_callback(
@@ -299,214 +293,6 @@ void Driver::setupParamService() {
 			std::bind(&Driver::updatePacketTimer,
 					this,
 					std::placeholders::_1));
-}
-
-/**
- * @brief Method to setup node parameters.
- *
- * This method will declare, describe, and assign values to node parameters
- * Will assign a default value if one is not provided already, or a provided value fails verification.
- */
-void Driver::setupParams() {
-	std::stringstream ss;
-
-	// Baud Rate - Read only
-	rcl_interfaces::msg::ParameterDescriptor baud_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"Baud rate for communication with AdvancedNavigation Device\n" <<
-			"Default: " << DEFAULT_BAUD_RATE;
-	baud_description.description = ss.str();
-	ss.str(""); // empty the stream
-	baud_description.name = "baud_rate";
-	baud_description.read_only = true;
-	baud_description.additional_constraints = "\n\tSupported Baud Rates:\n\t  2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000, 2000000";
-	this->declare_parameter<int>("baud_rate", DEFAULT_BAUD_RATE, baud_description);
-	if( validateBaudRate( this->get_parameter("baud_rate") ).successful ) { // Check that it is valid and save
-		comms_data_.baud_rate = (int) this->get_parameter("baud_rate").as_int();
-	}else {// If invalid save default.
-		RCLCPP_ERROR(this->get_logger(), "Invalid baud rate. Setting to default: %d", DEFAULT_BAUD_RATE);
-		this->set_parameter(rclcpp::Parameter("baud_rate", DEFAULT_BAUD_RATE));
-		comms_data_.baud_rate = DEFAULT_BAUD_RATE;
-	}
-
-	// Com_port - Read only
-	rcl_interfaces::msg::ParameterDescriptor com_port_description = rcl_interfaces::msg::ParameterDescriptor();
-	com_port_description.description = "Communications port for serial operation\n  Default: \"/dev/ttyUSB0\"";
-	com_port_description.name = "com_port";
-	com_port_description.read_only = true;
-	this->declare_parameter<std::string>("com_port", DEFAULT_COM_PORT, com_port_description);
-	if( validateComPort( this->get_parameter("com_port") ).successful ) { // Check that it is valid and save
-		comms_data_.com_port = this->get_parameter("com_port").as_string();
-	}else { // If invalid save default.
-		RCLCPP_ERROR(this->get_logger(), "Invalid com port. Setting to default: %s", DEFAULT_COM_PORT);
-		this->set_parameter(rclcpp::Parameter("com_port", DEFAULT_COM_PORT));
-		comms_data_.com_port = DEFAULT_COM_PORT;
-	}
-
-	rcl_interfaces::msg::IntegerRange intervalRange;
-	intervalRange.from_value = 1000;
-	intervalRange.to_value   = 1000000;
-	intervalRange.step 		 = 1;
-
-	// Read timer interval
-	rcl_interfaces::msg::ParameterDescriptor read_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"Parameter for controlling sensor serial polling period in microseconds (μs)\n" <<
-			"  Default: " << DEFAULT_TIMER_PERIOD << "μs";
-	read_description.name = "read_us";
-	read_description.description = ss.str();
-	ss.str(""); // empty the stream
-	read_description.integer_range.push_back(intervalRange);
-	this->declare_parameter<int>("read_us", DEFAULT_TIMER_PERIOD, read_description);
-	if( validateReadUs( this->get_parameter("read_us") ).successful ) { // Check that it is valid and save
-		read_timer_interval_ = std::chrono::microseconds(this->get_parameter("read_us").as_int());
-	}else { // If invalid save default.
-		RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to default: %d", DEFAULT_TIMER_PERIOD);
-		this->set_parameter(rclcpp::Parameter("read_us", DEFAULT_TIMER_PERIOD));
-		read_timer_interval_ = std::chrono::microseconds(DEFAULT_TIMER_PERIOD);
-	}
-
-	// Publish timer interval
-	rcl_interfaces::msg::ParameterDescriptor publish_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"Parameter for controlling ROS publishing period in microseconds (μs)\n" <<
-			"  Default: " << DEFAULT_TIMER_PERIOD << "μs";
-	publish_description.description = ss.str();
-	ss.str(""); // empty the stream
-	publish_description.name = "publish_us";
-	publish_description.integer_range.push_back(intervalRange);
-	publish_description.additional_constraints = "Value must be greater than read_us";
-	this->declare_parameter<int>("publish_us", DEFAULT_TIMER_PERIOD, publish_description);
-	if( validatePublishUs( this->get_parameter("publish_us") ).successful ) { // Check that it is valid and save
-		publish_timer_interval_ = std::chrono::microseconds(this->get_parameter("publish_us").as_int());
-	}else { // If invalid save default.
-		// Is the current read_us higher than the default set it to read_us
-		if(DEFAULT_TIMER_PERIOD < this->get_parameter("read_us").as_int()) {
-			RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to read_us: %ld", this->get_parameter("read_us").as_int());
-			this->set_parameter(rclcpp::Parameter("publish_us", this->get_parameter("read_us").as_int()));
-			publish_timer_interval_ = std::chrono::microseconds(this->get_parameter("read_us").as_int());
-		}else { // otherwise set to default.
-			RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to default: %d", DEFAULT_TIMER_PERIOD);
-			this->set_parameter(rclcpp::Parameter("publish_us", DEFAULT_TIMER_PERIOD));
-			publish_timer_interval_ = std::chrono::microseconds(DEFAULT_TIMER_PERIOD);
-		}
-	}
-
-
-
-	// Request packet array
-	rcl_interfaces::msg::ParameterDescriptor packet_request_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"\tInteger Vector for Requested Packet ID's and their Period\n" <<
-			"\t\tSee ANPP Documentation for more information on packets and IDs and Periods\n" <<
-			"  Usage: [ID1, Period1, ID2, Period2, ...]\n" <<
-			"  Default: [20, 10, 28, 10]";
-	packet_request_description.description = ss.str();
-	ss.str(""); // empty the stream
-	packet_request_description.name = "packet_request";
-	ss << 	"Must contain a minimum of 1 packet, every packet ID must have a corresponding rate.\n"<<
-			"\tFor IDs:\n" <<
-			"\t  Status Packets: [0-" << end_system_packets-1 << "]\n" <<
-			"\t  State Packets: [" << START_STATE_PACKETS << "-" << end_state_packets-1 << "]\n" <<
-			"\t  Configuration Packets: [" << START_CONFIGURATION_PACKETS << "-" << end_configuration_packets-1 << "]\n" <<
-			"\tFor Periods:\n" <<
-			"\t  Min value: " << MIN_PACKET_PERIOD << "\n" <<
-			"\t  Max value: " << MAX_PACKET_PERIOD << "\n" <<
-			"\t  Step: " << 1;
-	packet_request_description.additional_constraints = ss.str();
-	ss.str(""); // empty the stream
-	std::vector<int64_t> default_vector(DEFAULT_PACKET_REQUEST, DEFAULT_PACKET_REQUEST + (sizeof(DEFAULT_PACKET_REQUEST)/sizeof(DEFAULT_PACKET_REQUEST[0])));
-	this->declare_parameter("packet_request", rclcpp::ParameterValue(default_vector), packet_request_description);
-	if( validatePacketRequest( this->get_parameter("packet_request") ).successful ) { // Check that it is valid and save
-		packet_request_ = this->get_parameter("packet_request").as_integer_array();
-	}else { // If invalid save default.
-		RCLCPP_ERROR(this->get_logger(), "Invalid packet request. Setting to default: %s", DEFAULT_PACKET_REQUEST_STR);
-		this->set_parameter(rclcpp::Parameter("packet_request", default_vector));
-		packet_request_ = default_vector;
-	}
-
-	// Packet Timer Period
-	rcl_interfaces::msg::ParameterDescriptor packet_timer_period_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"\tInteger value for Packet Timing Period in μs\n"<<
-			"\t\tSee ANPP Documentation for more information on Packets and IDs\n" <<
-			"  Default: 10,000";
-	packet_timer_period_description.description = ss.str();
-	ss.str(""); // empty the stream
-	packet_timer_period_description.name = "packet_timer_period";
-	rcl_interfaces::msg::IntegerRange ptpdRange;
-	ptpdRange.from_value = MIN_TIMER_PERIOD;
-	ptpdRange.to_value   = MAX_TIMER_PERIOD;
-	ptpdRange.step 		 = 1;
-	packet_timer_period_description.integer_range.push_back(ptpdRange);
-	this->declare_parameter<int>("packet_timer_period", 10000, packet_timer_period_description);
-	if( validatePacketTimer(this->get_parameter("packet_timer_period") ).successful) { // Check that it is valid and save
-		packet_timer_period_ = (int) this->get_parameter("packet_timer_period").as_int();
-	}else {// If invalid save default.
-		RCLCPP_ERROR(this->get_logger(), "Invalid packet timer period. Setting to default: %d", DEFAULT_PACKET_TIMER_PERIOD);
-		this->set_parameter(rclcpp::Parameter("packet_timer_period", DEFAULT_PACKET_TIMER_PERIOD));
-		packet_timer_period_ = DEFAULT_PACKET_TIMER_PERIOD;
-	}
-
-	// IP Address - Read only
-	rcl_interfaces::msg::ParameterDescriptor ip_address_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"IPv4 address to connect to the device on.\n"<<
-			"  Default: 0.0.0.0";
-	ip_address_description.description = ss.str();
-	ss.str(""); // empty the stream
-	ip_address_description.name = "ip_address";
-	ip_address_description.read_only = true;
-	this->declare_parameter<std::string>("ip_address", DEFAULT_IP_ADDRESS, ip_address_description);
-	comms_data_.ip_address = this->get_parameter("ip_address").as_string();
-
-	// Port - Read only
-	rcl_interfaces::msg::ParameterDescriptor ip_port_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"Port to connect to the Advanced Navigation device on\n"<<
-			"  Default: 0";
-	ip_port_description.description = ss.str();
-	ss.str(""); // empty the stream
-	ip_port_description.name = "port";
-	ip_port_description.read_only = true;
-	rcl_interfaces::msg::IntegerRange portRange;
-	portRange.from_value = MIN_PORT;
-	portRange.to_value   = MAX_PORT;
-	portRange.step 		 = 1;
-	ip_port_description.integer_range.push_back(portRange);
-	this->declare_parameter<int>("port", 0, ip_port_description);
-	comms_data_.port = (int) this->get_parameter("port").as_int();
-
-	// Logging Path - Read Only
-	rcl_interfaces::msg::ParameterDescriptor log_path_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << "Path for all logfiles to be placed. Default '~/.ros/log/'\n";
-	log_path_description.description = ss.str();
-	ss.str("");
-	log_path_description.name = "log_path";
-	log_path_description.read_only = true;
-	this->declare_parameter<std::string>("log_path", "~/.ros/log/", log_path_description);
-	log_path_ = this->get_parameter("log_path").as_string();
-
-
-	// Comms Select - Read only
-	rcl_interfaces::msg::ParameterDescriptor comms_select_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"What method will be used to communicate with the device.\n"<<
-			"  Default: 0: Serial\n" <<
-			"  1: TCP Client\n" <<
-			"  2: TCP Server\n" <<
-			"  3: UDP\n" <<
-			"  4: CAN\n";
-	comms_select_description.description = ss.str();
-	ss.str(""); // empty the stream
-	comms_select_description.name = "comm_select";
-	comms_select_description.read_only = true;
-	rcl_interfaces::msg::IntegerRange commRange;
-	commRange.from_value = 0;
-	commRange.to_value   = 4;
-	commRange.step 		 = 1;
-	comms_select_description.integer_range.push_back(commRange);
-	this->declare_parameter<int>("comm_select", adnav::CONNECTION_SERIAL, comms_select_description);
-	comms_data_.method = this->get_parameter("comm_select").as_int();
-
-	rcl_interfaces::msg::ParameterDescriptor convert_desc;
-	convert_desc.description = "Convert ENU Twist to FLU Twist.\n"
-		"  Default: false\n"
-		"  If true, the ENU Twist will be converted to FLU Twist before publishing.";
-	convert_desc.read_only = true;
-	convert_twist_enu_to_flu_ = this->declare_parameter<bool>("convert_twist_enu_to_flu", false, convert_desc);
 }
 
 //~~~~~~ Control Functions
@@ -589,9 +375,10 @@ void Driver::RestartPublisher() {
 	// Cancel old timer to stop callbacks from triggering while remaking timer.
 	publish_timer_->cancel();
 
+	const auto params = param_listener_->get_params();
 	// Reset the timer using the class stored interval.
 	publish_timer_ = this->create_wall_timer(
-      	publish_timer_interval_ , std::bind(&Driver::publishTimerCallback, this), publishing_group_);
+      	std::chrono::microseconds(params.publish_us), std::bind(&Driver::publishTimerCallback, this), publishing_group_);
 }
 
 /**
@@ -603,9 +390,11 @@ void Driver::RestartReader() {
 	// Cancel old timer to stop callbacks from triggering while remaking timer.
 	read_timer_->cancel();
 
+	const auto params = param_listener_->get_params();
+
 	// Reset the timer using the class stored interval.
 	read_timer_ = this->create_wall_timer(
-		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
+		std::chrono::microseconds(params.read_us), std::bind(&Driver::recievePackets, this), reading_group_);
 }
 
 //~~~~~~ Diagnostic Functions
@@ -1055,9 +844,7 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePublishUs(const rclcpp:
  *
  * @param parameter const rclcpp::Parameter. updated Publish us parameter
  */
-void Driver::updatePublishUs(const rclcpp::Parameter& parameter) {
-	publish_timer_interval_ = std::chrono::microseconds(parameter.as_int());
-
+void Driver::updatePublishUs([[maybe_unused]] const rclcpp::Parameter& parameter) {
 	RestartPublisher();
 }
 
@@ -1109,9 +896,7 @@ rcl_interfaces::msg::SetParametersResult Driver::validateReadUs(const rclcpp::Pa
  *
  * @param parameter const rclcpp::Parameter. updated Read us parameter
  */
-void Driver::updateReadUs(const rclcpp::Parameter& parameter) {
-	read_timer_interval_ = std::chrono::microseconds(parameter.as_int());
-
+void Driver::updateReadUs([[maybe_unused]] const rclcpp::Parameter& parameter) {
 	RestartReader();
 }
 
@@ -1150,7 +935,7 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketRequest(const rcl
 	}
 
 	// Check all elements of the request array
-	for(unsigned int i = 0; i < parameter.as_integer_array().size(); i++) {
+	for(std::size_t i = 0; i < parameter.as_integer_array().size(); i++) {
 		// if even (ID)
 		int64_t element = parameter.as_integer_array().at(i);
 		if(i%2 == 0) {
@@ -1176,25 +961,27 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketRequest(const rcl
 	return result;
 }
 
+std::vector<adnav_interfaces::msg::PacketPeriod> Driver::getPacketRequest() {
+	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
+	const auto params = param_listener_->get_params();
+
+	// Create and fill a periods format.
+	for(std::size_t i = 0; (i+i) < params.packet_request.size(); i++) {
+		adnav_interfaces::msg::PacketPeriod period;
+		period.packet_id = params.packet_request[i+i];
+		period.packet_period = params.packet_request[i+i+1];
+		packet_periods.push_back(period);
+	}
+	return packet_periods;
+}
+
 /**
- * @brief Function to Update the Packet Request parameter, create temporary service client and update the device using service
+ * @brief Function to Update the Packet Request parameter
  *
  * @param parameter const rclcpp::Parameter. updated Packet Request parameter
  */
-void Driver::updatePacketRequest(const rclcpp::Parameter& parameter) {
-
-	packet_request_ = parameter.as_integer_array();
-
-	// Create and fill a periods format.
-	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
-	for(uint64_t i = 0; (i+i) < packet_request_.size(); i++) {
-		adnav_interfaces::msg::PacketPeriod period;
-		period.packet_id = packet_request_[i+i];
-		period.packet_period = packet_request_[i+i+1];
-		packet_periods.push_back(period);
-	}
-
-	(void) SendPacketPeriods(packet_periods);
+void Driver::updatePacketRequest([[maybe_unused]] const rclcpp::Parameter& parameter) {
+	SendPacketPeriods(getPacketRequest());
 }
 
 /**
@@ -1235,11 +1022,10 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketTimer(const rclcp
  *
  * @param parameter const rclcpp::Parameter. updated PacketTimer parameter
  */
-void Driver::updatePacketTimer(const rclcpp::Parameter& parameter) {
-	packet_timer_period_ = (int) parameter.as_int();
-
+void Driver::updatePacketTimer([[maybe_unused]] const rclcpp::Parameter& parameter) {
 	// Send to the device.
-	(void) SendPacketTimer(packet_timer_period_);
+	const auto params = param_listener_->get_params();
+	SendPacketTimer(params.packet_timer_period);
 }
 
 //~~~~~~ NTRIP Functions
@@ -1277,9 +1063,10 @@ void Driver::updateNTRIPClientService() {
 	ntrip_client_->set_report_interval(DEFAULT_GPGGA_REPORT_PERIOD);
 	ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 
+	const auto params = param_listener_->get_params();
 	// Guard to stop bad hostend return.
 	if(ntrip_state_.he != nullptr) {
-		rtcm_logger_.openFile((std::string("Log_") + std::string(ntrip_state_.he->h_name)), ".rtcm", log_path_);
+		rtcm_logger_.openFile((std::string("Log_") + std::string(ntrip_state_.he->h_name)), ".rtcm", params.log_path);
 	}
 }
 
@@ -1483,7 +1270,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vecto
 
 	int j = 0;
 	for(adnav_interfaces::msg::PacketPeriod i : periods) {
-		ss << "\tID: " << (int)i.packet_id << "\tPeriod: "<< i.packet_period << std::endl;
+		ss << "\tID: " << static_cast<int>(i.packet_id) << "\tPeriod: "<< i.packet_period << std::endl;
 		packet_periods_packet.packet_periods[j].packet_id = i.packet_id;
 		packet_periods_packet.packet_periods[j].period = i.packet_period;
 		j++;
@@ -1516,7 +1303,7 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 		an_decoder_increment(&an_decoder, bytes);
 
 		// Decode all the packets in the buffer
-		while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
+		while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
 		 {
 			RCLCPP_DEBUG(this->get_logger(), "ID: %d", an_packet->id);
 
@@ -1653,7 +1440,7 @@ void Driver::deviceInfoDecoder(an_packet_t* an_packet) {
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
 void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
-
+	const auto params = param_listener_->get_params();
 	system_state_packet_t system_state_packet;
 	std::stringstream ss;
 	std::unique_lock<std::mutex> lock(messages_mutex_);
@@ -1714,16 +1501,20 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			);
 
 			// TWIST
-			twist_msg_.linear.x = system_state_packet.velocity[0];
-			twist_msg_.linear.y = system_state_packet.velocity[1];
-			twist_msg_.linear.z = system_state_packet.velocity[2];
+
+			if (!params.use_body_velocity)
+			{
+				twist_msg_.linear.x = system_state_packet.velocity[0];
+				twist_msg_.linear.y = system_state_packet.velocity[1];
+				twist_msg_.linear.z = system_state_packet.velocity[2];
+
+				if (params.convert_twist_enu_to_flu) {
+					twist_msg_ = transformTwistEnuToFlu(twist_msg_, orientation_);
+				}
+			}
 			twist_msg_.angular.x = system_state_packet.angular_velocity[0];
 			twist_msg_.angular.y = system_state_packet.angular_velocity[1];
 			twist_msg_.angular.z = system_state_packet.angular_velocity[2];
-
-			if (convert_twist_enu_to_flu_) {
-				twist_msg_ = transformTwistEnuToFlu(twist_msg_, orientation_);
-			}
 
 			twist_stamped_msg_.twist = twist_msg_;
 			twist_stamped_msg_.header = nav_fix_msg_.header;
