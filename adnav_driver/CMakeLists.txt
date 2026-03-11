@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.28)
 project(adnav_driver)
 
 # Default to C99
@@ -6,7 +6,6 @@ if(NOT CMAKE_C_STANDARD)
   set(CMAKE_C_STANDARD 99)
 endif()
 
-# Default to C++14
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -32,6 +31,8 @@ find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(adnav_interfaces REQUIRED)
+find_package(generate_parameter_library REQUIRED)
+
 
 # Build
 include_directories(
@@ -63,6 +64,12 @@ set(DEPENDENCIES
 set(EXECUTABLE_NAME "adnav_driver")
 
 ament_target_dependencies(${PROJECT_NAME}_lib ${DEPENDENCIES})
+
+generate_parameter_library(
+        adnav_parameters
+        src/adnav_parameters.yaml
+)
+target_link_libraries(${PROJECT_NAME}_lib adnav_parameters)
 
 add_executable(${EXECUTABLE_NAME} src/main.cpp)
 target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib)

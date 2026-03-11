@@ -1,0 +1,54 @@
+adnav:
+  baud_rate:
+    type: int
+    default_value: 115200
+    description: "Baud rate for serial communication with the Advanced Navigation device"
+    validation:
+      one_of<>: [[2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000, 2000000]]
+  com_port:
+    type: string
+    default_value: "/dev/ttyUSB0"
+    description: "Serial port for communication with the Advanced Navigation device"
+    read_only: true
+  publish_us:
+    type: int
+    default_value: 20000
+    description: "Parameter for controlling the ROS topic publish period in microseconds"
+    validation:
+      bounds<>: [10000, 1000000]
+  packet_request:
+    type: int_array
+    default_value: [20, 10, 28, 10]
+    description: "Array of packet IDs and their corresponding polling frequencies in Hz. The array should be in the format [packet_id_1, frequency_1, packet_id_2, frequency_2, ...]. Supported packet IDs can be found in the AdvancedNavigation documentation."
+  packet_timer_period:
+    type: int
+    default_value: 1000
+    description: "Integer value for Packet Timing Period in μs"
+  comm_select:
+    type: int
+    default_value: 0
+    description: "Method of communication with the device. 0: Serial, 1: TCP Client, 2: TCP Server, 3: UDP Client, 4: CAN"
+    validation:
+      one_of<>: [[0, 1, 2, 3, 4]]
+  ip_address:
+    type: string
+    default_value: "0.0.0.0"
+    description: "IP address for communication with the Advanced Navigation device when using Ethernet connection"
+  port:
+    type: int
+    default_value: 16718
+    description: "Port for communication with the Advanced Navigation device when using Ethernet connection"
+    validation:
+      bounds<>: [1, 65535]
+  convert_twist_enu_to_flu:
+    type: bool
+    default_value: false
+    description: "If true, converts Twist messages from ENU to FLU frame convention."
+  log_path:
+    type: string
+    default_value: "~/.ros/log/"
+    description: "Directory path where log files will be stored"
+  use_body_velocity:
+    type: bool
+    default_value: false
+    description: "If true, use body velocity packet data instead of transforming state packet velocity."
