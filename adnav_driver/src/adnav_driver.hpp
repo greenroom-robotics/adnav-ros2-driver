@@ -31,7 +31,6 @@
 
 // C System Headers
 #include <stdio.h>      // FILE
-#include <sstream>      // Stringstream
 #include <fstream>
 
 // C++ System Headers
@@ -65,7 +64,6 @@
 #include "diagnostic_updater/diagnostic_updater.hpp"
 #include <tf2/LinearMath/Quaternion.h>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
-#include <std_msgs/msg/string.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/time_reference.hpp>
 #include <sensor_msgs/msg/imu.hpp>

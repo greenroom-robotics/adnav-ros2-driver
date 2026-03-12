@@ -26,7 +26,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "adnav_driver.h"
+#include "adnav_driver.hpp"
 
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 

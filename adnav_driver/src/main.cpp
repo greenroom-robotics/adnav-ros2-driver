@@ -26,7 +26,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "adnav_driver.h"
+#include "adnav_driver.hpp"
 
 int main(int argc, char * argv[])
 {
