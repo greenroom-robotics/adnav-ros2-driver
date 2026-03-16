@@ -201,7 +201,6 @@ class Driver : public rclcpp::Node
     //~~~~~~~~~~~~~~~~~~~~~ Private Methods.
 
     //~~~~~~ Setup Functions
-    void waitForDevicePacket();
     void requestDeviceInfo();
     void createPublishers();
     void createServices();

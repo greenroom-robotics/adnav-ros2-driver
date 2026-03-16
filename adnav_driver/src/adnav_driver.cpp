@@ -185,57 +185,11 @@ rclcpp::Time time_from_state_packet(const system_state_packet_t& state_packet) {
 }
 
 /**
- * @brief Function to ask for device information from a Advanced navigation device and wait for its response.
- */
-void Driver::waitForDevicePacket() {
-	// initialize the decoder.
-	an_decoder_t an_decoder;
-	an_packet_t *an_packet;
-	an_decoder_initialise(&an_decoder);
-	bool recieved = false;
-	int bytes_received;
-
-	while(recieved == false && rclcpp::ok()) {
-		// Request the device to send the Device info packet.
-		requestDeviceInfo();
-
-		// Read in some data from the connection.
-		// bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
-
-		// Decode all data and act on only the device info data.
-		if (bytes_received > 0)
-		 {
-			anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), bytes_received);
-
-			// Increment the decode buffer length by the number of bytes received
-			an_decoder_increment(&an_decoder, bytes_received);
-
-			while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
-			 {
-				RCLCPP_DEBUG(this->get_logger(), "[WaitForDevicePacket]ID: %d", an_packet->id);
-
-				if(an_packet->id == packet_id_device_information) {
-					RCLCPP_DEBUG(this->get_logger(), "Received Device Information Packet (ANPP.3)");
-					deviceInfoDecoder(an_packet);
-					recieved = true;
-
-				}
-
-				// Ensure that you free the an_packet when your done with it or you will leak memory
-				an_packet_free(&an_packet);
-			}
-		}
-	}
-}
-
-/**
  * @brief Function to request a Advanced Navigation Devices info using ANPP.
  */
 void Driver::requestDeviceInfo() {
-	an_packet_t* an_packet;
-
 	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
-	an_packet = encode_request_packet(packet_id_device_information);
+	an_packet_t* an_packet = encode_request_packet(packet_id_device_information);
 	encodeAndSend(an_packet);
 }
 
