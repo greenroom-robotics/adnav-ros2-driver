@@ -31,13 +31,14 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace adnav {
+
 /**
  * @brief Constructor for the Advanced Navigation Driver node
  *
  * This will create a Driver instance. Declare node parameters, setup threading groups and callbacks.
  * Initialize the log file, and open the communications to the device.
  */
-Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
+Driver::Driver(): rclcpp::Node("adnav_driver")
 {
 	// Set default values
 	memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
@@ -65,39 +66,83 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 		std::chrono::microseconds(params.publish_us), std::bind(&Driver::publishTimerCallback, this),
 		publishing_group_);
 
-	read_timer_ = this->create_wall_timer(
-		std::chrono::microseconds(params.read_us), std::bind(&Driver::recievePackets, this), reading_group_);
-
-	// Setup Services for the node
 	createServices();
 
 	// Open a new ANPP Log file for data logging
 	anpp_logger_.openFile("Log_", ".anpp", params.log_path);
 
-	// Open Communications with the device
-
-	adnav_connections_data_t comms_data {};
-	comms_data.method = params.comm_select;
-	comms_data.com_port = params.com_port;
-	comms_data.ip_address = params.ip_address;
-	comms_data.port = params.port;
-
-	communicator_ = std::make_unique<adnav::Communicator>(comms_data);
-	communicator_->open();
-
-	// Request device info with Packet 1 and 3
-	waitForDevicePacket();
-
-	// Create Publishers for the node
 	createPublishers();
 
-	// Send current setup of timer period, and packet periods to the device.
-	deviceSetup();
+	connection_thread_ = std::jthread([&](std::stop_token st){
+		auto loop = uvw::loop::get_default();
+
+		close_async_ = loop->resource<uvw::async_handle>();
+		close_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &async) {
+			// This fires on the loop thread — safe to close handles here
+			if (tcp_handle_) {
+				tcp_handle_->stop();
+			}
+			async.close();  // close the async handle itself so the loop can exit
+		});
+
+		while (!st.stop_requested()) {
+			tcp_handle_ = loop->resource<uvw::tcp_handle>();
+
+			tcp_handle_->on<uvw::error_event>([&](const uvw::error_event &err, uvw::tcp_handle &)
+			{
+				RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "TCP: Connection Error: %s - stopping", err.what());
+				close_async_->send();
+			});
+
+			tcp_handle_->on<uvw::end_event>([&](const uvw::end_event &, uvw::tcp_handle &) {
+				RCLCPP_INFO(rclcpp::get_logger("adnav_driver"), "TCP: End Event");
+				close_async_->send();
+			});
+
+			tcp_handle_->on<uvw::connect_event>([&](const uvw::connect_event &, uvw::tcp_handle &tcp) {
+				RCLCPP_INFO(this->get_logger(), "Connection established");
+				// tcp.keep_alive(true, uvw::tcp_handle::time{2});
+
+				if (const auto err = uv_tcp_keepalive_ex(tcp.raw(), 1, 1, 1, 2); err != 0) {
+					RCLCPP_ERROR(this->get_logger(), "Failed to set TCP keep-alive: %s", uv_strerror(err));
+					throw std::runtime_error("Failed to set TCP keep-alive");
+				}
+				tcp.read();
+				requestDeviceInfo();
+				deviceSetup();
+			});
+
+			tcp_handle_->on<uvw::data_event>([&](const uvw::data_event &event, uvw::tcp_handle &) {
+				std::span<const uint8_t> buffer(
+					reinterpret_cast<const uint8_t*>(event.data.get()), event.length);
+				RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes", buffer.size());
+				receivePackets(buffer);
+			});
+
+			const auto _params = param_listener_->get_params();
+			RCLCPP_INFO(this->get_logger(), "Attempting to connect to %s:%ld", _params.ip_address.c_str(), _params.port);
+			tcp_handle_->connect(std::string{_params.ip_address}, _params.port);
+			loop->run();
+			RCLCPP_DEBUG(this->get_logger(), "Event loop ended");
+			tcp_handle_->close();
+
+			if (!st.stop_requested())
+			{
+				RCLCPP_ERROR(this->get_logger(), "Attempting reconnect in 2 seconds");
+				std::condition_variable_any cv;
+				std::mutex mtx;
+				std::stop_callback cb(st, [&]
+				{
+					cv.notify_all();
+				});
+				std::unique_lock lock(mtx);
+				cv.wait_for(lock, st, std::chrono::seconds(2), [&st]{ return st.stop_requested(); });
+			}
+		}
+	});
 
 	diagnostic_updater_->add("System Status", this, &Driver::system_status_diagnostic);
 	diagnostic_updater_->add("Filter Status", this, &Driver::filter_status_diagnostic);
-
-	RCLCPP_DEBUG(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
 }
 
 /**
@@ -118,10 +163,11 @@ Driver::~Driver() {
 		rtcm_logger_.closeFile();
 	}
 
-	if (communicator_)
-	{
-		communicator_->close();
+	connection_thread_.request_stop();
+	if (close_async_) {
+		close_async_->send();  // ← thread-safe wakeup
 	}
+	connection_thread_.join();
 }
 
 rclcpp::Time time_from_state_packet(const system_state_packet_t& state_packet) {
@@ -149,14 +195,12 @@ void Driver::waitForDevicePacket() {
 	bool recieved = false;
 	int bytes_received;
 
-	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
-
 	while(recieved == false && rclcpp::ok()) {
 		// Request the device to send the Device info packet.
 		requestDeviceInfo();
 
 		// Read in some data from the connection.
-		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		// bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
 
 		// Decode all data and act on only the device info data.
 		if (bytes_received > 0)
@@ -190,6 +234,7 @@ void Driver::waitForDevicePacket() {
 void Driver::requestDeviceInfo() {
 	an_packet_t* an_packet;
 
+	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
 	an_packet = encode_request_packet(packet_id_device_information);
 	encodeAndSend(an_packet);
 }
@@ -276,12 +321,6 @@ void Driver::setupParamService() {
 					this,
 					std::placeholders::_1));
 
-	// read period updater callback
-	read_us_cb_ = param_handler_->add_parameter_callback("read_us",
-			std::bind(&Driver::updateReadUs,
-					this,
-					std::placeholders::_1));
-
 	// packet request updater callback
 	packet_request_cb_ = param_handler_->add_parameter_callback("packet_request",
 			std::bind(&Driver::updatePacketRequest,
@@ -304,16 +343,17 @@ void Driver::setupParamService() {
  *
  * This Function will also create a log file session and log incoming data to it.
  */
-void Driver::recievePackets() {
-	// initialize the decoder.
+void Driver::receivePackets(const std::span<const uint8_t> buffer) {
 	an_decoder_t an_decoder;
 	an_decoder_initialise(&an_decoder);
-	int bytes_received;
 
-	// get the bytes from the communication method, and load them into the decoder
-	bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+	// Copy incoming data into the decoder buffer
+	const auto buffer_bytes = std::min(buffer.size(), an_decoder_size(&an_decoder));
+	std::memcpy(an_decoder_pointer(&an_decoder), buffer.data(), buffer_bytes);
 
-	decodePackets(an_decoder, bytes_received);
+	anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), buffer_bytes);
+	an_decoder_increment(&an_decoder, buffer_bytes);
+	decodePackets(an_decoder, buffer_bytes);
 }
 
 /**
@@ -323,27 +363,13 @@ void Driver::recievePackets() {
  * Awaits a signal from a ROS Decoder method before publishing and accessing shared data.
  */
 void Driver::publishTimerCallback() {
-	// Since the messages can be filled in other threads ensure exclusive access.
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-
-	// Debug timekeeper value
-	rcl_time_point_value_t time = 0, diff = 0;
-
-	// Check for updates from other threads.
-	if(!msg_write_done_) {
-		time = this->get_clock().get()->now().nanoseconds();
-		// Only wait until timeout. otherwise log error and exit callback.
-		if (msg_cv_.wait_for(lock, std::chrono::milliseconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
-			RCLCPP_DEBUG(this->get_logger(), "Publish Timeout");
-			if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
-			RCLCPP_DEBUG(this->get_logger(), "PubTimeout:\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
-			return;
-		}
+	if (!tcp_handle_ || !tcp_handle_->active())
+	{
+		return;
 	}
 
-	// Debug message to show how long it waited to be awoken.
-	if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: L\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
+	// Since the messages can be filled in other threads ensure exclusive access.
+	std::unique_lock<std::mutex> lock(messages_mutex_);
 
 	// PUBLISH MESSAGES
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
@@ -359,11 +385,6 @@ void Driver::publishTimerCallback() {
 	pose_stamped_pub_->publish(pose_stamped_msg_);
 	geo_pose_pub_->publish(geo_pose_msg_);
 	geo_pose_stamped_pub_->publish(geo_pose_stamped_msg_);
-
-	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
-
-	// Restore the blocking flag before exiting the lock guard.
-	msg_write_done_ = false;
 }
 
 /**
@@ -379,22 +400,6 @@ void Driver::RestartPublisher() {
 	// Reset the timer using the class stored interval.
 	publish_timer_ = this->create_wall_timer(
       	std::chrono::microseconds(params.publish_us), std::bind(&Driver::publishTimerCallback, this), publishing_group_);
-}
-
-/**
- * @brief Function to cancel and restart the Reader timer.
- */
-void Driver::RestartReader() {
-	RCLCPP_INFO(this->get_logger(), "Restarting Reader Timer");
-
-	// Cancel old timer to stop callbacks from triggering while remaking timer.
-	read_timer_->cancel();
-
-	const auto params = param_listener_->get_params();
-
-	// Reset the timer using the class stored interval.
-	read_timer_ = this->create_wall_timer(
-		std::chrono::microseconds(params.read_us), std::bind(&Driver::recievePackets, this), reading_group_);
 }
 
 //~~~~~~ Diagnostic Functions
@@ -706,14 +711,10 @@ rcl_interfaces::msg::SetParametersResult Driver::ParamSetCallback(const std::vec
 
 		// Validation of parameters
 		// Only if they require validation
-		// Baud rate
-		if (parameter.get_name() == "baud_rate") result.reason += validateBaudRate(parameter).reason;
 		// comport
-		else if (parameter.get_name() == "com_port") result.reason += validateComPort(parameter).reason;
+		if (parameter.get_name() == "com_port") result.reason += validateComPort(parameter).reason;
 		// Publisher Interval Duration
 		else if (parameter.get_name() == "publish_us") result.reason += validatePublishUs(parameter).reason;
-		// Sensor Polling Interval Duration
-		else if (parameter.get_name() == "read_us") result.reason += validateReadUs(parameter).reason;
 		// Packet IDs and Rates
 		else if (parameter.get_name() == "packet_request") result.reason += validatePacketRequest(parameter).reason;
 		// Packet Timer Period
@@ -722,54 +723,6 @@ rcl_interfaces::msg::SetParametersResult Driver::ParamSetCallback(const std::vec
 
 	if(result.reason != "") {
 		result.successful = false;
-	}
-	return result;
-}
-
-/**
- * @brief Function to validate the proposed parameter change to the Baud Rate parameter.
- *
- * @param parameter const rclcpp::Parameter. proposed change to the Baud Rate parameter.
- * @return returns a SetParametersResult message containing a success value and a string descriptor.
- */
-rcl_interfaces::msg::SetParametersResult Driver::validateBaudRate(const rclcpp::Parameter& parameter) {
-	rcl_interfaces::msg::SetParametersResult result;
-	result.reason = "";
-	result.successful = true;
-
-	// Stringstream to stream in faults.
-	std::stringstream ss;
-
-	// Guard for parameter type
-	if(parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
-		result.successful = false;
-		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
-	}
-
-	// test for valid baudrate
-	switch(parameter.as_int())
-	 {
-		case    2400 : 	break;
-		case    4800 : 	break;
-		case    9600 : 	break;
-		case   19200 : 	break;
-		case   38400 : 	break;
-		case   57600 : 	break;
-		case  115200 : 	break;
-		case  230400 : 	break;
-		case  460800 : 	break;
-		case  500000 : 	break;
-		case  576000 : 	break;
-		case  921600 : 	break;
-		case 1000000 : 	break;
-		case 2000000 : 	break;
-		default      : 	result.successful = false;
-						ss << "\n[Error] Invalid Baud Rate\n";
-					   	break;
-	}
-
-	if(!result.successful)	 {
-		result.reason = ss.str();
 	}
 	return result;
 }
@@ -820,12 +773,6 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePublishUs(const rclcpp:
 		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
 	}
 
-	// Guard for less than read_us
-	if(parameter.as_int() < this->get_parameter("read_us").as_int()) {
-		result.successful = false;
-		ss << "\n[Error] Publish period must be greater than or equal to read period\n";
-	}
-
 	// Guard for timer range
 	if(parameter.as_int() < 1000 || parameter.as_int() > 1000000) {
 		result.successful = false;
@@ -846,58 +793,6 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePublishUs(const rclcpp:
  */
 void Driver::updatePublishUs([[maybe_unused]] const rclcpp::Parameter& parameter) {
 	RestartPublisher();
-}
-
-/**
- * @brief Function to validate the proposed parameter change to the Read us parameter.
- *
- * @param parameter const rclcpp::Parameter. proposed change to the Read us parameter.
- * @return returns a SetParametersResult message containing a success value and a string descriptor.
- */
-rcl_interfaces::msg::SetParametersResult Driver::validateReadUs(const rclcpp::Parameter& parameter) {
-	rcl_interfaces::msg::SetParametersResult result;
-	result.reason = "";
-	result.successful = true;
-
-	// Stringstream to stream in faults.
-	std::stringstream ss;
-
-	// Guard for parameter type
-	if(parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
-		result.successful = false;
-		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
-	}
-
-	// Guard for timer range
-	if(parameter.as_int() < 1000 || parameter.as_int() > 1000000) {
-		result.successful = false;
-		ss << "\n[Error] Read Period " << parameter.as_int() << " is invalid. Out of range.";
-	}
-
-	// Ensure that the publish timer is not lower than the new read period.
-	try
-	 {
-		if(parameter.as_int() > this->get_parameter("publish_us").as_int()) {
-			result.successful = false;
-			ss << "[Error] Publish Period (" << this->get_parameter("publish_us").as_int() <<
-				") is less than requested read period (" << parameter.as_int() << ").\n";
-		}
-	} // This catch will be thrown on startup as read is initialized period to publish.
-	catch(const rclcpp::exceptions::ParameterNotDeclaredException& e) {}
-
-	if(!result.successful)	 {
-		result.reason = ss.str();
-	}
-	return result;
-}
-
-/**
- * @brief Function to Update the Read us parameter, create temporary service client and update node timer using service
- *
- * @param parameter const rclcpp::Parameter. updated Read us parameter
- */
-void Driver::updateReadUs([[maybe_unused]] const rclcpp::Parameter& parameter) {
-	RestartReader();
 }
 
 /**
@@ -1168,8 +1063,13 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
  */
 void Driver::encodeAndSend(an_packet_t* an_packet) {
 	an_packet_encode(an_packet);
-	// Send encoded packet through the selected communication medium
-	communicator_->write(an_packet_pointer(an_packet), an_packet_size(an_packet));
+
+	const auto size = static_cast<unsigned int>(an_packet_size(an_packet));
+	auto data = std::make_unique<char[]>(size);
+	std::memcpy(data.get(), an_packet_pointer(an_packet), size);
+
+	tcp_handle_->write(std::move(data), size);
+
 	// Free the packet to avoid memory leaks
 	an_packet_free(&an_packet);
 }
@@ -1297,15 +1197,12 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 	// If there are bytes to be decoded.
 	an_packet_t* an_packet;
 	if (bytes > 0) {
-
-		anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), bytes);
-		// Increment the decode buffer length by the number of bytes received
-		an_decoder_increment(&an_decoder, bytes);
-
 		// Decode all the packets in the buffer
+		std::unique_lock<std::mutex> lock(messages_mutex_);
+
 		while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
 		 {
-			RCLCPP_DEBUG(this->get_logger(), "ID: %d", an_packet->id);
+			RCLCPP_DEBUG(this->get_logger(), "RX Packet IDs %hhu", an_packet->id);
 
 			switch (an_packet->id)
 			 {
@@ -1342,8 +1239,8 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			}
 			// Ensure that you free the an_packet when your done with it or you will leak memory
 			an_packet_free(&an_packet);
-		} // while an_packet != NULL
-	}// if bytes > 0
+		}
+	}
 }
 
 /**
@@ -1443,10 +1340,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	const auto params = param_listener_->get_params();
 	system_state_packet_t system_state_packet;
 	std::stringstream ss;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: L\tAccess: %d", P20_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
 	if(decode_system_state_packet(&system_state_packet, an_packet) == 0)
 	 {
@@ -1558,11 +1451,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 				RCLCPP_INFO(this->get_logger(), "Event 1 Occurred.");
 			}
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P20_num_++, diff/1000);
 }
 
 /**
@@ -1576,11 +1464,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 	ecef_position_packet_t ecef_position_packet;
 
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: L\tAccess: %d", P33_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
-
 	// ECEF Position (in meters) Packet for Pose Message
 	if(decode_ecef_position_packet(&ecef_position_packet, an_packet) == 0)
 	 {
@@ -1588,12 +1471,6 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 		pose_msg_.position.y = ecef_position_packet.position[1];
 		pose_msg_.position.z = ecef_position_packet.position[2];
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P33_num_++, diff/1000);
 }
 
 /**
@@ -1606,10 +1483,6 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
  */
 void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
 	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27: \tMutex: L\tAccess: %d", P27_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
 	if(decode_quaternion_orientation_standard_deviation_packet(&quaternion_orientation_standard_deviation_packet, an_packet) == 0)
 	 {
@@ -1618,12 +1491,6 @@ void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
 		imu_msg_.orientation_covariance[4] = quaternion_orientation_standard_deviation_packet.standard_deviation[1];
 		imu_msg_.orientation_covariance[8] = quaternion_orientation_standard_deviation_packet.standard_deviation[2];
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P27_num_++, diff/1000);
 }
 
 /**
@@ -1636,12 +1503,6 @@ void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
  */
 void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 	raw_sensors_packet_t raw_sensors_packet;
-
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-
-	RCLCPP_DEBUG(this->get_logger(), "Packet 28: \tMutex: L\tAccess: %d", P28_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
 	// Fill the messages
 	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
@@ -1670,20 +1531,12 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
 
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);
 }
 
 void Driver::bodyVelRosDecoder(an_packet_t *an_packet)
 {
 	body_velocity_packet_t body_velocity_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	// Debug timekeeper
+
 	auto stamp_time = this->get_clock().get()->now();
 
 	if (decode_body_velocity_packet(&body_velocity_packet, an_packet) == 0)
@@ -1695,16 +1548,11 @@ void Driver::bodyVelRosDecoder(an_packet_t *an_packet)
 		twist_stamped_msg_.header.frame_id = frame_id_;
 		twist_stamped_msg_.twist = twist_msg_;
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
 }
 
 void Driver::extBodyVelRosDecoder(an_packet_t *an_packet)
 {
 	external_body_velocity_packet_t external_body_velocity_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	// Debug timekeeper
 	auto stamp_time = this->get_clock().get()->now();
 
 	if (decode_external_body_velocity_packet(&external_body_velocity_packet, an_packet) == 0)
@@ -1715,8 +1563,6 @@ void Driver::extBodyVelRosDecoder(an_packet_t *an_packet)
 		twist_stamped_msg_external_body.header.stamp = stamp_time;
 		twist_stamped_msg_external_body.header.frame_id = external_frame_id_;
 	}
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
 }
 
 }// namespace adnav
