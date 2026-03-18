@@ -243,6 +243,7 @@ class Driver : public rclcpp::Node
     //~~~~~~ Logging Functions
     void system_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
     void filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
+    void accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
 
     //~~~~~~ ROS Services
     void srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Request> request,

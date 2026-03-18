@@ -32,6 +32,7 @@
 
 namespace adnav {
 
+
 /**
  * @brief Constructor for the Advanced Navigation Driver node
  *
@@ -165,6 +166,7 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 
 	diagnostic_updater_->add("System Status", this, &Driver::system_status_diagnostic);
 	diagnostic_updater_->add("Filter Status", this, &Driver::filter_status_diagnostic);
+	diagnostic_updater_->add("Accuracy", this, &Driver::accuracy_diagnostic);
 }
 
 /**
@@ -490,7 +492,83 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 		stat.add("External Velocity Active", system_state_packet_->filter_status.b.external_velocity_active ? "Yes" : "No");
 		stat.add("External Heading Active", system_state_packet_->filter_status.b.external_heading_active ? "Yes" : "No");
 
+		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
+		stat.add("GNSS Fix Status", to_string(gnss_fix));
+
 		// TODO parameters need to be added to inform what is considered abnormal operation
+
+		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
+	} else {
+		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet not received");
+	}
+}
+
+
+/**
+ * Calculate positional accuracy from the standard deviation values in the system state packet.
+ * @param state_packet
+ * @return double, double: 2D RMS, 3D RMS
+ */
+std::tuple<double, double> position_accuracy_rms(const system_state_packet_t& state_packet) {
+	const auto [x, y, z] = state_packet.standard_deviation;
+	return {
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2)),
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2) + std::pow(z, 2))
+	};
+}
+
+double orientation_accuracy_stdev(const euler_orientation_standard_deviation_packet_t& orientation_packet) {
+	const auto [roll_stdev, pitch_stdev, yaw_stdev] = orientation_packet.standard_deviation;
+	return std::max({roll_stdev, pitch_stdev, yaw_stdev});
+}
+
+/**
+ * Calculate velocity accuracy from the standard deviation values
+ * @param velocity_standard_deviation
+ * @return double, double: 2D RMS, 3D RMS
+ */
+	std::tuple<double, double> velocity_accuracy_rms(const velocity_standard_deviation_packet_t& velocity_standard_deviation) {
+	const auto [x, y, z] = velocity_standard_deviation.standard_deviation;
+	return {
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2)),
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2) + std::pow(z, 2))
+	};
+}
+
+
+void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
+{
+	if (system_state_packet_.has_value())
+	{
+		auto last_rx_time = time_from_state_packet(system_state_packet_.value());
+
+		if (this->get_clock()->now() - last_rx_time < rclcpp::Duration(1, 0))
+		{
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet timeout");
+			return;
+		}
+
+		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
+		stat.add("Orientation Filter Initialised", system_state_packet_->filter_status.b.orientation_filter_initialised ? "Yes" : "No");
+		stat.add("Navigation Filter Initialised", system_state_packet_->filter_status.b.ins_filter_initialised ? "Yes" : "No");
+		stat.add("Heading Initialised", system_state_packet_->filter_status.b.heading_initialised ? "Yes" : "No");
+
+		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
+		stat.add("GNSS Fix Status", to_string(gnss_fix));
+
+		auto [rms_2d, rms_3d] = position_accuracy_rms(*system_state_packet_);
+		stat.add("Position Accuracy (2D RMS) (m)", std::to_string(rms_2d));
+		stat.add("Position Accuracy (3D RMS) (m)", std::to_string(rms_3d));
+
+		if (euler_orientation_standard_deviation_packet_.has_value()) {
+			const auto orientation_deviation = orientation_accuracy_stdev(*euler_orientation_standard_deviation_packet_);
+			stat.add("Orientation Deviation (max of roll, pitch, yaw) (rads)", std::to_string(orientation_deviation));
+		}
+
+		auto [vel_rms_2d, vel_rms_3d] = velocity_accuracy_rms(*velocity_standard_deviation_packet_);
+		stat.add("Velocity Accuracy (2D RMS) (m)", std::to_string(vel_rms_2d));
+		stat.add("Velocity Accuracy (3D RMS) (m)", std::to_string(vel_rms_3d));
 
 		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
 	} else {
