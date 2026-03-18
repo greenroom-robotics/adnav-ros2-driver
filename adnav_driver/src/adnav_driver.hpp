@@ -26,6 +26,8 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#pragma once
+
 #ifndef ADVANCED_NAVIGATION_DRIVER_H
 #define ADVANCED_NAVIGATION_DRIVER_H
 
@@ -33,18 +35,22 @@
 #include <fstream>
 
 // C++ System Headers
-#include <chrono>       // Time, std::chrono
-#include <memory>       // smart pointers
-#include <vector>       // std::vector
-#include <string>       // std::string
-#include <mutex>        // std::mutex, std:unique_lock
-#include <condition_variable>   // std::condition_variable
+#include <chrono>           // Time, std::chrono
+#include <memory>           // smart pointers
+#include <vector>           // std::vector
+#include <string>           // std::string
+#include <mutex>            // std::mutex, std::unique_lock
+#include <future>           // std::promise, std::future
+#include <queue>            // std::queue
+#include <unordered_map>    // std::unordered_map
 #include <thread>
 
 #include <an_packet_protocol.h>
 #include <ins_packets.h>
 #include <adnav_logger.h>
 #include <adnav_ntrip.h>
+
+#include "anpp.hpp"
 
 #include "uvw.hpp"
 
@@ -81,15 +87,27 @@
 
 namespace adnav {
 
-constexpr const double RADIANS_TO_DEGREES = (180.0/M_PI);
-constexpr const int    DEFAULT_PACKET_REQUEST[4] = {20, 10, 28, 10};
-constexpr const bool   DEFAULT_NTRIP_STATE = false;
-constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
-constexpr const int    DEFAULT_TIMEOUT = 5;
-constexpr const int    MAX_TIMER_PERIOD = 65535;
-constexpr const int    MIN_TIMER_PERIOD = 1000;
-constexpr const int    MIN_PACKET_PERIOD = 1;
-constexpr const int    MAX_PACKET_PERIOD = 65535;
+    struct PacketIdTime {
+        uint8_t packet_id;
+        std::chrono::microseconds period;
+    };
+
+    inline constexpr std::array<PacketIdTime, 5> REQUIRED_PACKETS = {
+        {
+            {packet_id_system_state, std::chrono::microseconds(50)},
+            {packet_id_raw_sensors, std::chrono::microseconds(50)},
+            {packet_id_body_velocity, std::chrono::microseconds(50)},
+            {packet_id_euler_orientation_standard_deviation, std::chrono::microseconds(50)},
+            {packet_id_velocity_standard_deviation, std::chrono::microseconds(50)}
+        }};
+
+constexpr double RADIANS_TO_DEGREES = (180.0/M_PI);
+constexpr int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
+constexpr int    DEFAULT_TIMEOUT = 5;
+constexpr int    MAX_TIMER_PERIOD = 65535;
+constexpr int    MIN_TIMER_PERIOD = 1000;
+constexpr int    MIN_PACKET_PERIOD = 1;
+constexpr int    MAX_PACKET_PERIOD = 65535;
 
 typedef struct {
     bool en;
@@ -116,17 +134,25 @@ class Driver : public rclcpp::Node
 
     // device communication settings
     std::jthread connection_thread_;
+    std::jthread setup_thread_;                     // runs deviceSetup() off the event loop
+    std::shared_ptr<uvw::loop> loop_;
     std::shared_ptr<uvw::async_handle> close_async_;
+    std::shared_ptr<uvw::async_handle> write_async_;
     std::shared_ptr<uvw::tcp_handle> tcp_handle_;
+
+    // Write queue — encodeAndSend pushes here; write_async_ drains it on the loop thread
+    std::mutex write_q_mutex_;
+    std::queue<std::pair<std::unique_ptr<char[]>, unsigned int>> write_q_;
 
     // Log files.
     adnav::Logger anpp_logger_;
     adnav::Logger rtcm_logger_;
 
     // ANPP Packet variables
-    acknowledge_packet_t acknowledge_packet_;  // only access with protection of acknowledge_mutex_
     std::optional<device_information_packet_t> device_information_packet_;
     std::optional<system_state_packet_t> system_state_packet_;
+    std::optional<euler_orientation_standard_deviation_packet_t> euler_orientation_standard_deviation_packet_;
+    std::optional<velocity_standard_deviation_packet_t> velocity_standard_deviation_packet_;
 
     // Msgs. Only access with protection of messages_mutex_
     tf2::Quaternion                 orientation_;
@@ -187,9 +213,11 @@ class Driver : public rclcpp::Node
 
     // Threading variables
     std::mutex messages_mutex_;
-    std::mutex acknowledge_mutex_;
-    std::condition_variable srv_cv_;
-    bool acknowledge_recieve_;
+
+    // Pending request-reply tracking keyed by the packet_id being acknowledged.
+    // Promises are inserted under pending_acks_mutex_; resolved/erased only on the loop thread.
+    std::mutex pending_acks_mutex_;
+    std::unordered_map<uint8_t, std::shared_ptr<std::promise<acknowledge_packet_t>>> pending_acks_;
 
     // NTRIP Variables
     std::unique_ptr<adnav::ntrip::Client> ntrip_client_;
@@ -241,7 +269,8 @@ class Driver : public rclcpp::Node
 
     //~~~~~~ Device Communication Functions
     void encodeAndSend(an_packet_t* an_packet);
-    adnav_interfaces::msg::RawAcknowledge AcknowledgeHandler();
+    adnav_interfaces::msg::RawAcknowledge sendAndAwaitAck(an_packet_t* an_packet);
+    void failAllPendingAcks();
     adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true , bool permanent = true);
     adnav_interfaces::msg::RawAcknowledge SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
         bool clear_existing = true, bool permanent = true);

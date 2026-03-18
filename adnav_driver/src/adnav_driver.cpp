@@ -40,9 +40,6 @@ namespace adnav {
  */
 Driver::Driver(): rclcpp::Node("adnav_driver")
 {
-	// Set default values
-	memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
-
 	// ~~~~~~~~~~ Create the callback groups
 	// Callback group only for reading ANPP Packets
 	reading_group_ 		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -75,6 +72,7 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 
 	connection_thread_ = std::jthread([&](std::stop_token st){
 		auto loop = uvw::loop::get_default();
+		loop_ = loop;
 
 		close_async_ = loop->resource<uvw::async_handle>();
 		close_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &async) {
@@ -82,7 +80,22 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 			if (tcp_handle_) {
 				tcp_handle_->stop();
 			}
+			if (write_async_) {
+				write_async_->close();
+			}
 			async.close();  // close the async handle itself so the loop can exit
+		});
+
+		write_async_ = loop->resource<uvw::async_handle>();
+		write_async_->on<uvw::async_event>([this](const uvw::async_event &, uvw::async_handle &) {
+			std::unique_lock lock(write_q_mutex_);
+			while (!write_q_.empty()) {
+				auto [data, size] = std::move(write_q_.front());
+				write_q_.pop();
+				lock.unlock();
+				tcp_handle_->write(std::move(data), size);
+				lock.lock();
+			}
 		});
 
 		while (!st.stop_requested()) {
@@ -91,11 +104,13 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 			tcp_handle_->on<uvw::error_event>([&](const uvw::error_event &err, uvw::tcp_handle &)
 			{
 				RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "TCP: Connection Error: %s - stopping", err.what());
+				failAllPendingAcks();
 				close_async_->send();
 			});
 
 			tcp_handle_->on<uvw::end_event>([&](const uvw::end_event &, uvw::tcp_handle &) {
 				RCLCPP_INFO(rclcpp::get_logger("adnav_driver"), "TCP: End Event");
+				failAllPendingAcks();
 				close_async_->send();
 			});
 
@@ -108,8 +123,15 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 					throw std::runtime_error("Failed to set TCP keep-alive");
 				}
 				tcp.read();
-				requestDeviceInfo();
-				deviceSetup();
+
+				// Run setup in a separate thread so it can block on request-reply futures
+				// without stalling the event loop. join() is fast — failAllPendingAcks() will
+				// have unblocked any in-flight future before we reach here on reconnect.
+				if (setup_thread_.joinable()) setup_thread_.join();
+				setup_thread_ = std::jthread([this] {
+					requestDeviceInfo();
+					deviceSetup();
+				});
 			});
 
 			tcp_handle_->on<uvw::data_event>([&](const uvw::data_event &event, uvw::tcp_handle &) {
@@ -242,13 +264,7 @@ void Driver::deviceSetup() {
 	RCLCPP_INFO(this->get_logger(), "Sending requested configuration to device:");
 
 	const auto params = param_listener_->get_params();
-
-	// Create and send a Packet Timer Period Packet.
-	acknowledge_recieve_ = true; // Since we are not waiting for device acknowledgement at startup
 	SendPacketTimer(params.packet_timer_period); // Will overwrite acknowledge_receive_ to false
-
-	// Since we are not waiting for device acknowledgement at startup
-	acknowledge_recieve_ = true;
 	SendPacketPeriods(getPacketRequest()); // Will overwrite acknowledge_receive_ to false.
 }
 
@@ -460,6 +476,8 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 			return;
 		}
 
+		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
 		stat.add("Orientation Filter Initialised", system_state_packet_->filter_status.b.orientation_filter_initialised ? "Yes" : "No");
 		stat.add("Navigation Filter Initialised", system_state_packet_->filter_status.b.ins_filter_initialised ? "Yes" : "No");
 		stat.add("Heading Initialised", system_state_packet_->filter_status.b.heading_initialised ? "Yes" : "No");
@@ -491,13 +509,8 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 void Driver::srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Request> request,
 		std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Response> response) {
 
-	// Send config to device.
-	SendPacketTimer(request->packet_timer_period, request->utc_synchronisation, request->permanent);
+	response->acknowledgement = SendPacketTimer(request->packet_timer_period, request->utc_synchronisation, request->permanent);
 
-	// Await the response.
-	response->acknowledgement = AcknowledgeHandler();
-
-	// notify of result.
 	char buf[15];
 	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
 	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
@@ -814,12 +827,22 @@ std::vector<adnav_interfaces::msg::PacketPeriod> Driver::getPacketRequest() {
 	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
 	const auto params = param_listener_->get_params();
 
-	// Create and fill a periods format.
-	for(std::size_t i = 0; (i+i) < params.packet_request.size(); i++) {
-		adnav_interfaces::msg::PacketPeriod period;
-		period.packet_id = params.packet_request[i+i];
-		period.packet_period = params.packet_request[i+i+1];
-		packet_periods.push_back(period);
+	if (params.send_packet_periods)
+	{
+		for (const auto& pkt : REQUIRED_PACKETS)
+		{
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = pkt.packet_id;
+			period.packet_period = pkt.period.count();
+			packet_periods.push_back(period);
+		}
+
+		for (std::size_t i = 0; (i+i) < params.additional_packet_request.size(); i++) {
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = params.additional_packet_request[i+i];
+			period.packet_period = params.additional_packet_request[i+i+1];
+			packet_periods.push_back(period);
+		}
 	}
 	return packet_periods;
 }
@@ -1021,44 +1044,80 @@ void Driver::encodeAndSend(an_packet_t* an_packet) {
 	const auto size = static_cast<unsigned int>(an_packet_size(an_packet));
 	auto data = std::make_unique<char[]>(size);
 	std::memcpy(data.get(), an_packet_pointer(an_packet), size);
-
-	tcp_handle_->write(std::move(data), size);
-
-	// Free the packet to avoid memory leaks
 	an_packet_free(&an_packet);
+
+	{
+		std::lock_guard lock(write_q_mutex_);
+		write_q_.push({std::move(data), size});
+	}
+	write_async_->send();
 }
 
 /**
- * @brief Function to handle the acknowledgement of configuration from a device in a thread safe manner.
+ * @brief Register a pending promise for the acknowledge of @p an_packet, send it,
+ *        then block until the device replies or @c DEFAULT_TIMEOUT seconds elapse.
  *
- * Needs to interact with the reading thread to receive the packet. Uses a conditional variable to flag when a
- * packet has been received.
+ * Thread-safe: may be called from any thread (e.g. setup_thread_ or a ROS service thread).
+ * The actual TCP write is always dispatched onto the event loop via write_async_.
  *
- * @return Raw Acknowledge Message
+ * @param an_packet Encoded ANPP packet whose reply we are waiting for.
+ * @return RawAcknowledge message; result field is 0xFF on timeout or connection drop.
  */
-adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
-	// make acknowledgement data structure
-	adnav_interfaces::msg::RawAcknowledge msg;
+adnav_interfaces::msg::RawAcknowledge Driver::sendAndAwaitAck(an_packet_t* an_packet) {
+	const uint8_t packet_id = an_packet->id;
 
-	// Wait for an acknowledge packet to be received.
-	std::unique_lock<std::mutex> lock(acknowledge_mutex_);
-	if(!acknowledge_recieve_) {
-		if(srv_cv_.wait_for(lock, std::chrono::seconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
-			RCLCPP_ERROR(this->get_logger(), "acknowledgement Timeout");
-			msg.result++; // make error condition
-			return msg;
-		}
+	// Register the promise BEFORE sending to avoid a race where the ack arrives
+	// before we have inserted the entry.
+	auto promise = std::make_shared<std::promise<acknowledge_packet_t>>();
+	std::future<acknowledge_packet_t> future = promise->get_future();
+	{
+		std::lock_guard lock(pending_acks_mutex_);
+		pending_acks_[packet_id] = promise;
 	}
 
-	// acknowledge_packet_
-	msg.id  = acknowledge_packet_.packet_id;
-	msg.crc = acknowledge_packet_.packet_crc;
-	msg.result = acknowledge_packet_.acknowledge_result;
+	encodeAndSend(an_packet);
 
-	// reset condition variable.
-	acknowledge_recieve_ = false;
+	adnav_interfaces::msg::RawAcknowledge msg;
+
+	if (future.wait_for(std::chrono::seconds(DEFAULT_TIMEOUT)) != std::future_status::ready) {
+		RCLCPP_ERROR(this->get_logger(), "ACK timeout for packet %d", packet_id);
+		std::lock_guard lock(pending_acks_mutex_);
+		pending_acks_.erase(packet_id);
+		msg.result = 0xFF;
+		return msg;
+	}
+
+	try {
+		const auto pkt = future.get();
+		msg.id     = pkt.packet_id;
+		msg.crc    = pkt.packet_crc;
+		msg.result = pkt.acknowledge_result;
+	} catch (const std::exception& e) {
+		// Promise was broken by failAllPendingAcks() — connection dropped mid-wait
+		RCLCPP_ERROR(this->get_logger(), "ACK aborted for packet %d: %s", packet_id, e.what());
+		msg.result = 0xFF;
+	}
 
 	return msg;
+}
+
+/**
+ * @brief Fail all in-flight request-reply promises with an exception.
+ *
+ * Called on disconnect (error_event / end_event) so that any thread blocked in
+ * sendAndAwaitAck() unblocks immediately rather than waiting for the full timeout.
+ */
+void Driver::failAllPendingAcks() {
+	std::lock_guard lock(pending_acks_mutex_);
+	for (auto& [id, promise] : pending_acks_) {
+		try {
+			promise->set_exception(std::make_exception_ptr(
+				std::runtime_error("Connection lost")));
+		} catch (const std::future_error&) {
+			// Already satisfied — ignore
+		}
+	}
+	pending_acks_.clear();
 }
 
 /**
@@ -1070,7 +1129,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
  * @return acknowledgement Message
  */
 adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_period, bool utc_sync, bool permanent) {
-	RCLCPP_DEBUG_STREAM(this->get_logger(), "Incoming Packet Timer Request:\nUTC Sync: " <<
+	RCLCPP_DEBUG_STREAM(this->get_logger(), "Sending Packet Timer Request:\nUTC Sync: " <<
 		(utc_sync ? "True\n":"False\n") <<
 		"\tPermanent: " << (permanent ? "True\n":"False\n") <<
 		"\tPeriod (μs): " << packet_timer_period << "\n");
@@ -1087,13 +1146,10 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_p
 	packet_timer_period_packet.utc_synchronisation = utc_sync;
 	packet_timer_period_packet.packet_timer_period = packet_timer_period;
 
-	// Send the packet.
+	// Send the packet and block until the device acknowledges or timeout.
 	RCLCPP_INFO(this->get_logger(), "Sending Packet Timer Request to device.");
 	an_packet = encode_packet_timer_period_packet(&packet_timer_period_packet);
-	encodeAndSend(an_packet);
-
-	// Return the acknowledgement result.
-	return AcknowledgeHandler();
+	return sendAndAwaitAck(an_packet);
 }
 
 /**
@@ -1107,7 +1163,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_p
 adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
 	bool clear_existing, bool permanent) {
 	std::stringstream ss;
-	ss << "incoming Packet Request:\nClear: " << (clear_existing ? "True\n":"False\n") <<
+	ss << "Sending Packet Request:\nClear: " << (clear_existing ? "True\n":"False\n") <<
 		"Permanent: " << (permanent ? "True\n":"False\n") <<
 		"Number Requested: " << periods.size() << std::endl;
 
@@ -1134,9 +1190,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vecto
 
 	RCLCPP_INFO(this->get_logger(), "Sending Packet Periods Request to device.");
 	an_packet = encode_packet_periods_packet(&packet_periods_packet);
-	encodeAndSend(an_packet);
-
-	return AcknowledgeHandler();
+	return sendAndAwaitAck(an_packet);
 }
 
 //~~~~~~ Decoders
@@ -1175,6 +1229,16 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
 				break;
 
+			case packet_id_euler_orientation_standard_deviation:
+				euler_orientation_standard_deviation_packet_.emplace();
+				decode_euler_orientation_standard_deviation_packet(&*euler_orientation_standard_deviation_packet_, an_packet);
+				break;
+
+			case packet_id_velocity_standard_deviation:
+				velocity_standard_deviation_packet_.emplace();
+				decode_velocity_standard_deviation_packet(&*velocity_standard_deviation_packet_, an_packet);
+				break;
+
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
@@ -1198,28 +1262,33 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 }
 
 /**
- * @brief Function to decode a acknowledgement packet and notify relevant services.
+ * @brief Function to decode a acknowledgement packet and fulfill the matching pending promise.
+ *
+ * Called on the event loop thread from decodePackets(). Looks up the promise registered
+ * by sendAndAwaitAck() for this packet_id and sets its value to unblock the waiting thread.
  *
  * @param an_packet pointer to a an_packet_t object from which to decode the information.
  */
 void Driver::acknowledgeDecoder(an_packet_t* an_packet) {
-	// worker thread gets lock
-	std::unique_lock<std::mutex> lock(acknowledge_mutex_);
-
-	// Decode packet and warn if error.
-	if(decode_acknowledge_packet(&acknowledge_packet_, an_packet))
-	 {
+	acknowledge_packet_t pkt{};
+	if (decode_acknowledge_packet(&pkt, an_packet)) {
 		RCLCPP_WARN(this->get_logger(), "Error decoding Acknowledge Packet");
+		return;
 	}
 
-	RCLCPP_DEBUG(this->get_logger(), "acknowledgement received.\nID: %d\nResult: %d\n",
-		acknowledge_packet_.packet_id, acknowledge_packet_.acknowledge_result);
+	RCLCPP_DEBUG(this->get_logger(), "Acknowledge received. ID: %d  Result: %d",
+		pkt.packet_id, pkt.acknowledge_result);
 
-	// Set the acknowledgement received to true
-	acknowledge_recieve_ = true;
-
-	// Notify the service thread
-	srv_cv_.notify_one();
+	std::lock_guard lock(pending_acks_mutex_);
+	auto it = pending_acks_.find(pkt.packet_id);
+	if (it != pending_acks_.end()) {
+		try {
+			it->second->set_value(pkt);
+		} catch (const std::future_error&) {
+			// Already timed out — ignore
+		}
+		pending_acks_.erase(it);
+	}
 }
 
 /**

@@ -16,10 +16,14 @@ adnav:
     description: "Parameter for controlling the ROS topic publish period in microseconds"
     validation:
       bounds<>: [10000, 1000000]
-  packet_request:
+  send_packet_periods:
+    type: bool
+    default_value: true
+    description: "If true, the driver will configure the packet periods overriding the default settings on the device."
+  additional_packet_request:
     type: int_array
-    default_value: [20, 10, 28, 10]
-    description: "Array of packet IDs and their corresponding polling frequencies in Hz. The array should be in the format [packet_id_1, frequency_1, packet_id_2, frequency_2, ...]. Supported packet IDs can be found in the AdvancedNavigation documentation."
+    default_value: []
+    description: "Array of additional packet IDs and their corresponding polling frequencies in microseconds. The array should be in the format [packet_id_1, period_1, packet_id_2, period_2, ...]. Supported packet IDs can be found in the AdvancedNavigation documentation."
   packet_timer_period:
     type: int
     default_value: 1000
