@@ -314,7 +314,7 @@ bool Driver::requestDeviceInfo() {
 	}
 
 	try {
-		const auto pkt = future.get();
+		[[maybe_unused]] const auto pkt = future.get();
 		return true;
 	} catch (const std::exception& e) {
 		// Promise was broken by failAllPendingReplies() — connection dropped mid-wait
