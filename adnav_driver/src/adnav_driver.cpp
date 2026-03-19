@@ -73,81 +73,150 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 
 	connection_thread_ = std::jthread([&](std::stop_token st){
 		auto loop = uvw::loop::get_default();
-		loop_ = loop;
-
-		close_async_ = loop->resource<uvw::async_handle>();
-		close_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &async) {
-			// This fires on the loop thread — safe to close handles here
-			if (tcp_handle_) {
-				tcp_handle_->stop();
-			}
-			if (write_async_) {
-				write_async_->close();
-			}
-			async.close();  // close the async handle itself so the loop can exit
-		});
-
-		write_async_ = loop->resource<uvw::async_handle>();
-		write_async_->on<uvw::async_event>([this](const uvw::async_event &, uvw::async_handle &) {
-			std::unique_lock lock(write_q_mutex_);
-			while (!write_q_.empty()) {
-				auto [data, size] = std::move(write_q_.front());
-				write_q_.pop();
-				lock.unlock();
-				tcp_handle_->write(std::move(data), size);
-				lock.lock();
-			}
-		});
 
 		while (!st.stop_requested()) {
-			tcp_handle_ = loop->resource<uvw::tcp_handle>();
+			const auto _params = param_listener_->get_params();
+			auto dest = uvw::socket_address{_params.ip_address, static_cast<unsigned int>(_params.port)};
 
-			tcp_handle_->on<uvw::error_event>([&](const uvw::error_event &err, uvw::tcp_handle &)
+			std::shared_ptr<uvw::tcp_handle> tcp_handle;
+			std::shared_ptr<uvw::udp_handle> udp_handle;
+
+			if (_params.comm_select == 1)
 			{
-				RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "TCP: Connection Error: %s - stopping", err.what());
-				failAllPendingAcks();
-				close_async_->send();
-			});
+				tcp_handle = loop->resource<uvw::tcp_handle>();
+			} else if (_params.comm_select == 3)
+			{
+				udp_handle = loop->resource<uvw::udp_handle>();
+			}
 
-			tcp_handle_->on<uvw::end_event>([&](const uvw::end_event &, uvw::tcp_handle &) {
-				RCLCPP_INFO(rclcpp::get_logger("adnav_driver"), "TCP: End Event");
-				failAllPendingAcks();
-				close_async_->send();
-			});
-
-			tcp_handle_->on<uvw::connect_event>([&](const uvw::connect_event &, uvw::tcp_handle &tcp) {
-				RCLCPP_INFO(this->get_logger(), "Connection established");
-				// tcp.keep_alive(true, uvw::tcp_handle::time{2});
-
-				if (const auto err = uv_tcp_keepalive_ex(tcp.raw(), 1, 1, 1, 2); err != 0) {
-					RCLCPP_ERROR(this->get_logger(), "Failed to set TCP keep-alive: %s", uv_strerror(err));
-					throw std::runtime_error("Failed to set TCP keep-alive");
+			close_async_ = loop->resource<uvw::async_handle>();
+			close_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &async) {
+				// This fires on the loop thread — safe to close handles here
+				if (tcp_handle) {
+					tcp_handle->stop();
 				}
-				tcp.read();
+				if (udp_handle) {
+					udp_handle->stop();
+				}
+				if (write_async_) {
+					write_async_->close();
+				}
+				async.close();  // close the async handle itself so the loop can exit
+			});
+
+			write_async_ = loop->resource<uvw::async_handle>();
+			write_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &) {
+				std::unique_lock lock(write_q_mutex_);
+				while (!write_q_.empty()) {
+					auto [data, size] = std::move(write_q_.front());
+					write_q_.pop();
+					lock.unlock();
+					if (tcp_handle)
+					{
+						tcp_handle->write(std::move(data), size);
+					}
+					if (udp_handle)
+					{
+						udp_handle->send(dest, std::move(data), size);
+					}
+					lock.lock();
+				}
+			});
+
+			if (tcp_handle)
+			{
+				tcp_handle->on<uvw::error_event>([&](const uvw::error_event &err, uvw::tcp_handle &)
+				{
+					RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "TCP: Connection Error: %s - stopping", err.what());
+					failAllPendingReplies();
+					close_async_->send();
+				});
+
+				tcp_handle->on<uvw::end_event>([&](const uvw::end_event &, uvw::tcp_handle &) {
+					RCLCPP_INFO(rclcpp::get_logger("adnav_driver"), "TCP: End Event");
+					failAllPendingReplies();
+					close_async_->send();
+				});
+
+				tcp_handle->on<uvw::connect_event>([&](const uvw::connect_event &, uvw::tcp_handle &tcp) {
+					RCLCPP_INFO(this->get_logger(), "TCP: Connection established");
+					// tcp.keep_alive(true, uvw::tcp_handle::time{2});
+
+					if (const auto err = uv_tcp_keepalive_ex(tcp.raw(), 1, 1, 1, 2); err != 0) {
+						RCLCPP_ERROR(this->get_logger(), "Failed to set TCP keep-alive: %s", uv_strerror(err));
+						throw std::runtime_error("Failed to set TCP keep-alive");
+					}
+					tcp.read();
+
+					// Run setup in a separate thread so it can block on request-reply futures
+					// without stalling the event loop. join() is fast — failAllPendingReplies() will
+					// have unblocked any in-flight future before we reach here on reconnect.
+					if (setup_thread_.joinable()) setup_thread_.join();
+					setup_thread_ = std::jthread([this] {
+						requestDeviceInfo();
+						deviceSetup();
+					});
+				});
+
+				tcp_handle->on<uvw::data_event>([&](const uvw::data_event &event, uvw::tcp_handle &) {
+					std::span<const uint8_t> buffer(
+						reinterpret_cast<const uint8_t*>(event.data.get()), event.length);
+					RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes", buffer.size());
+					receivePackets(buffer);
+				});
+
+				RCLCPP_INFO(this->get_logger(), "TCP: Attempting to connect to %s:%ld", _params.ip_address.c_str(), _params.port);
+				tcp_handle->connect(dest);
+			}
+
+			if (udp_handle)
+			{
+				udp_handle->on<uvw::error_event>([&](const uvw::error_event &err, uvw::udp_handle &)
+				{
+					RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "UDP: Connection Error: %s - stopping", err.what());
+					failAllPendingReplies();
+					close_async_->send();
+				});
+
+				udp_handle->on<uvw::udp_data_event>([&](const uvw::udp_data_event &event, uvw::udp_handle &) {
+					std::span<const uint8_t> buffer(
+						reinterpret_cast<const uint8_t*>(event.data.get()), event.length);
+					RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes", buffer.size());
+					receivePackets(buffer);
+				});
+
+				udp_handle->bind(uvw::socket_address{_params.ip_address_local, static_cast<unsigned int>(_params.port)});
+				udp_handle->recv();
+
+				RCLCPP_INFO(this->get_logger(), "UDP: Created endpoint %s:%ld", _params.ip_address.c_str(), _params.port);
 
 				// Run setup in a separate thread so it can block on request-reply futures
-				// without stalling the event loop. join() is fast — failAllPendingAcks() will
+				// without stalling the event loop. join() is fast — failAllPendingReplies() will
 				// have unblocked any in-flight future before we reach here on reconnect.
 				if (setup_thread_.joinable()) setup_thread_.join();
 				setup_thread_ = std::jthread([this] {
-					requestDeviceInfo();
+					if (!requestDeviceInfo())
+					{
+						RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "Did not get a Device Information reply - stopping");
+						close_async_->send();
+						return;
+					}
 					deviceSetup();
 				});
-			});
+			}
 
-			tcp_handle_->on<uvw::data_event>([&](const uvw::data_event &event, uvw::tcp_handle &) {
-				std::span<const uint8_t> buffer(
-					reinterpret_cast<const uint8_t*>(event.data.get()), event.length);
-				RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes", buffer.size());
-				receivePackets(buffer);
-			});
-
-			const auto _params = param_listener_->get_params();
-			RCLCPP_INFO(this->get_logger(), "Attempting to connect to %s:%ld", _params.ip_address.c_str(), _params.port);
-			tcp_handle_->connect(std::string{_params.ip_address}, _params.port);
 			loop->run();
 			RCLCPP_DEBUG(this->get_logger(), "Event loop ended");
-			tcp_handle_->close();
+
+			if (tcp_handle)
+			{
+				tcp_handle->close();
+			}
+
+			if (udp_handle)
+			{
+				udp_handle->close();
+			}
 
 			if (!st.stop_requested())
 			{
@@ -211,10 +280,47 @@ rclcpp::Time time_from_state_packet(const system_state_packet_t& state_packet) {
 /**
  * @brief Function to request a Advanced Navigation Devices info using ANPP.
  */
-void Driver::requestDeviceInfo() {
+bool Driver::requestDeviceInfo() {
 	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
+	auto promise = std::make_shared<std::promise<device_information_packet_t>>();
+	auto future = promise->get_future();
+
+	{
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_[packet_id_device_information] = {
+			[promise](an_packet_t* pkt) {
+				device_information_packet_t decoded_pkt{};
+				if (decode_device_information_packet(&decoded_pkt, pkt)) {
+					promise->set_exception(std::make_exception_ptr(
+						std::runtime_error("Decode error")));
+					return;
+				}
+				try { promise->set_value(decoded_pkt); } catch (const std::future_error&) {}
+			},
+			[promise](std::exception_ptr ep) {
+				try { promise->set_exception(ep); } catch (const std::future_error&) {}
+			}
+		};
+	}
+
 	an_packet_t* an_packet = encode_request_packet(packet_id_device_information);
 	encodeAndSend(an_packet);
+
+	if (future.wait_for(std::chrono::seconds(DEFAULT_TIMEOUT)) != std::future_status::ready) {
+		RCLCPP_ERROR(this->get_logger(), "Reply timeout for Device Information");
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_.erase(packet_id_device_information);
+		return false;
+	}
+
+	try {
+		const auto pkt = future.get();
+		return true;
+	} catch (const std::exception& e) {
+		// Promise was broken by failAllPendingReplies() — connection dropped mid-wait
+		RCLCPP_ERROR(this->get_logger(), "ACK aborted for Device Information: %s", e.what());
+		return false;
+	}
 }
 
 /**
@@ -266,8 +372,8 @@ void Driver::deviceSetup() {
 	RCLCPP_INFO(this->get_logger(), "Sending requested configuration to device:");
 
 	const auto params = param_listener_->get_params();
-	SendPacketTimer(params.packet_timer_period); // Will overwrite acknowledge_receive_ to false
-	SendPacketPeriods(getPacketRequest()); // Will overwrite acknowledge_receive_ to false.
+	SendPacketTimer(params.packet_timer_period);
+	SendPacketPeriods(getPacketRequest());
 }
 
 /**
@@ -335,7 +441,7 @@ void Driver::receivePackets(const std::span<const uint8_t> buffer) {
  * Awaits a signal from a ROS Decoder method before publishing and accessing shared data.
  */
 void Driver::publishTimerCallback() {
-	if (!tcp_handle_ || !tcp_handle_->active())
+	if (!write_async_ || !write_async_->active())
 	{
 		return;
 	}
@@ -534,7 +640,6 @@ double orientation_accuracy_stdev(const euler_orientation_standard_deviation_pac
 		std::sqrt(std::pow(x, 2) + std::pow(y, 2) + std::pow(z, 2))
 	};
 }
-
 
 void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
 {
@@ -1132,8 +1237,11 @@ void Driver::encodeAndSend(an_packet_t* an_packet) {
 }
 
 /**
- * @brief Register a pending promise for the acknowledge of @p an_packet, send it,
+ * @brief Register a pending reply for the acknowledge of @p an_packet, send it,
  *        then block until the device replies or @c DEFAULT_TIMEOUT seconds elapse.
+ *
+ * Uses pending_replies_ keyed on packet_id_acknowledge, so any caller can use the
+ * same mechanism to await any other packet type by registering their own PendingReply.
  *
  * Thread-safe: may be called from any thread (e.g. setup_thread_ or a ROS service thread).
  * The actual TCP write is always dispatched onto the event loop via write_async_.
@@ -1144,13 +1252,26 @@ void Driver::encodeAndSend(an_packet_t* an_packet) {
 adnav_interfaces::msg::RawAcknowledge Driver::sendAndAwaitAck(an_packet_t* an_packet) {
 	const uint8_t packet_id = an_packet->id;
 
-	// Register the promise BEFORE sending to avoid a race where the ack arrives
-	// before we have inserted the entry.
 	auto promise = std::make_shared<std::promise<acknowledge_packet_t>>();
 	std::future<acknowledge_packet_t> future = promise->get_future();
+
+	// Register BEFORE sending to avoid a race where the ack arrives before the entry exists.
 	{
-		std::lock_guard lock(pending_acks_mutex_);
-		pending_acks_[packet_id] = promise;
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_[packet_id_acknowledge] = {
+			[promise](an_packet_t* pkt) {
+				acknowledge_packet_t ack{};
+				if (decode_acknowledge_packet(&ack, pkt)) {
+					promise->set_exception(std::make_exception_ptr(
+						std::runtime_error("Decode error")));
+					return;
+				}
+				try { promise->set_value(ack); } catch (const std::future_error&) {}
+			},
+			[promise](std::exception_ptr ep) {
+				try { promise->set_exception(ep); } catch (const std::future_error&) {}
+			}
+		};
 	}
 
 	encodeAndSend(an_packet);
@@ -1159,8 +1280,8 @@ adnav_interfaces::msg::RawAcknowledge Driver::sendAndAwaitAck(an_packet_t* an_pa
 
 	if (future.wait_for(std::chrono::seconds(DEFAULT_TIMEOUT)) != std::future_status::ready) {
 		RCLCPP_ERROR(this->get_logger(), "ACK timeout for packet %d", packet_id);
-		std::lock_guard lock(pending_acks_mutex_);
-		pending_acks_.erase(packet_id);
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_.erase(packet_id_acknowledge);
 		msg.result = 0xFF;
 		return msg;
 	}
@@ -1171,7 +1292,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::sendAndAwaitAck(an_packet_t* an_pa
 		msg.crc    = pkt.packet_crc;
 		msg.result = pkt.acknowledge_result;
 	} catch (const std::exception& e) {
-		// Promise was broken by failAllPendingAcks() — connection dropped mid-wait
+		// Promise was broken by failAllPendingReplies() — connection dropped mid-wait
 		RCLCPP_ERROR(this->get_logger(), "ACK aborted for packet %d: %s", packet_id, e.what());
 		msg.result = 0xFF;
 	}
@@ -1180,22 +1301,18 @@ adnav_interfaces::msg::RawAcknowledge Driver::sendAndAwaitAck(an_packet_t* an_pa
 }
 
 /**
- * @brief Fail all in-flight request-reply promises with an exception.
+ * @brief Fail all in-flight pending replies with an exception.
  *
  * Called on disconnect (error_event / end_event) so that any thread blocked in
- * sendAndAwaitAck() unblocks immediately rather than waiting for the full timeout.
+ * sendAndAwaitAck() or any other future.get() unblocks immediately.
  */
-void Driver::failAllPendingAcks() {
-	std::lock_guard lock(pending_acks_mutex_);
-	for (auto& [id, promise] : pending_acks_) {
-		try {
-			promise->set_exception(std::make_exception_ptr(
-				std::runtime_error("Connection lost")));
-		} catch (const std::future_error&) {
-			// Already satisfied — ignore
-		}
+void Driver::failAllPendingReplies() {
+	auto ep = std::make_exception_ptr(std::runtime_error("Connection lost"));
+	std::lock_guard lock(pending_replies_mutex_);
+	for (auto& [id, reply] : pending_replies_) {
+		reply.on_cancel(ep);
 	}
-	pending_acks_.clear();
+	pending_replies_.clear();
 }
 
 /**
@@ -1290,12 +1407,10 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 		 {
 			RCLCPP_DEBUG(this->get_logger(), "RX Packet IDs %hhu", an_packet->id);
 
+			bool handled = true;
 			switch (an_packet->id)
 			 {
 			case packet_id_device_information: deviceInfoDecoder(an_packet);
-				break;
-
-			case packet_id_acknowledge: acknowledgeDecoder(an_packet);
 				break;
 
 			case packet_id_system_state: systemStateRosDecoder(an_packet);
@@ -1329,43 +1444,33 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				break;
 
 			default:
-				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
-					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
+				handled = false;
 				break;
 			}
+
+			// Generic pending reply dispatch — fires for any packet_id registered in pending_replies_.
+			// Runs alongside named case handlers, so both can fire for the same packet (e.g. device info
+			// is always decoded above AND can also satisfy a request-reply future registered below).
+			{
+				std::unique_lock reply_lock(pending_replies_mutex_);
+				auto it = pending_replies_.find(an_packet->id);
+				if (it != pending_replies_.end()) {
+					auto cb = std::move(it->second.on_packet);
+					pending_replies_.erase(it);
+					reply_lock.unlock();
+					cb(an_packet);
+					handled = true;
+				}
+			}
+
+			if (!handled) {
+				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
+					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
+			}
+
 			// Ensure that you free the an_packet when your done with it or you will leak memory
 			an_packet_free(&an_packet);
 		}
-	}
-}
-
-/**
- * @brief Function to decode a acknowledgement packet and fulfill the matching pending promise.
- *
- * Called on the event loop thread from decodePackets(). Looks up the promise registered
- * by sendAndAwaitAck() for this packet_id and sets its value to unblock the waiting thread.
- *
- * @param an_packet pointer to a an_packet_t object from which to decode the information.
- */
-void Driver::acknowledgeDecoder(an_packet_t* an_packet) {
-	acknowledge_packet_t pkt{};
-	if (decode_acknowledge_packet(&pkt, an_packet)) {
-		RCLCPP_WARN(this->get_logger(), "Error decoding Acknowledge Packet");
-		return;
-	}
-
-	RCLCPP_DEBUG(this->get_logger(), "Acknowledge received. ID: %d  Result: %d",
-		pkt.packet_id, pkt.acknowledge_result);
-
-	std::lock_guard lock(pending_acks_mutex_);
-	auto it = pending_acks_.find(pkt.packet_id);
-	if (it != pending_acks_.end()) {
-		try {
-			it->second->set_value(pkt);
-		} catch (const std::future_error&) {
-			// Already timed out — ignore
-		}
-		pending_acks_.erase(it);
 	}
 }
 

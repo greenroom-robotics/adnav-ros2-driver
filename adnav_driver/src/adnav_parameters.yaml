@@ -36,8 +36,12 @@ adnav:
       one_of<>: [[0, 1, 2, 3, 4]]
   ip_address:
     type: string
-    default_value: "0.0.0.0"
+    default_value: ""
     description: "IP address for communication with the Advanced Navigation device when using Ethernet connection"
+  ip_address_local:
+    type: string
+    default_value: ""
+    description: "IP address of the host that will receive the UDP packets. This is only used when using UDP."
   port:
     type: int
     default_value: 16718

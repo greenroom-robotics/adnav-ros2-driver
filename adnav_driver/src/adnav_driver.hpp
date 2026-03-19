@@ -103,7 +103,7 @@ namespace adnav {
 
 constexpr double RADIANS_TO_DEGREES = (180.0/M_PI);
 constexpr int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
-constexpr int    DEFAULT_TIMEOUT = 5;
+constexpr int    DEFAULT_TIMEOUT = 2;
 constexpr int    MAX_TIMER_PERIOD = 65535;
 constexpr int    MIN_TIMER_PERIOD = 1000;
 constexpr int    MIN_PACKET_PERIOD = 1;
@@ -135,10 +135,8 @@ class Driver : public rclcpp::Node
     // device communication settings
     std::jthread connection_thread_;
     std::jthread setup_thread_;                     // runs deviceSetup() off the event loop
-    std::shared_ptr<uvw::loop> loop_;
     std::shared_ptr<uvw::async_handle> close_async_;
     std::shared_ptr<uvw::async_handle> write_async_;
-    std::shared_ptr<uvw::tcp_handle> tcp_handle_;
 
     // Write queue — encodeAndSend pushes here; write_async_ drains it on the loop thread
     std::mutex write_q_mutex_;
@@ -214,10 +212,15 @@ class Driver : public rclcpp::Node
     // Threading variables
     std::mutex messages_mutex_;
 
-    // Pending request-reply tracking keyed by the packet_id being acknowledged.
-    // Promises are inserted under pending_acks_mutex_; resolved/erased only on the loop thread.
-    std::mutex pending_acks_mutex_;
-    std::unordered_map<uint8_t, std::shared_ptr<std::promise<acknowledge_packet_t>>> pending_acks_;
+    // Pending request-reply tracking. Keyed by the expected reply packet_id.
+    // Works for any packet type — register a PendingReply before sending, and
+    // decodePackets will dispatch it when that packet_id arrives.
+    struct PendingReply {
+        std::function<void(an_packet_t*)>       on_packet;  // called on the loop thread with the reply
+        std::function<void(std::exception_ptr)> on_cancel;  // called when the connection drops
+    };
+    std::mutex pending_replies_mutex_;
+    std::unordered_map<uint8_t, PendingReply> pending_replies_;
 
     // NTRIP Variables
     std::unique_ptr<adnav::ntrip::Client> ntrip_client_;
@@ -229,10 +232,11 @@ class Driver : public rclcpp::Node
     //~~~~~~~~~~~~~~~~~~~~~ Private Methods.
 
     //~~~~~~ Setup Functions
-    void requestDeviceInfo();
+    bool requestDeviceInfo();
+    void deviceSetup();
+
     void createPublishers();
     void createServices();
-    void deviceSetup();
     void setupParamService();
 
     //~~~~~~ Control Functions
@@ -271,14 +275,13 @@ class Driver : public rclcpp::Node
     //~~~~~~ Device Communication Functions
     void encodeAndSend(an_packet_t* an_packet);
     adnav_interfaces::msg::RawAcknowledge sendAndAwaitAck(an_packet_t* an_packet);
-    void failAllPendingAcks();
+    void failAllPendingReplies();
     adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true , bool permanent = true);
     adnav_interfaces::msg::RawAcknowledge SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
         bool clear_existing = true, bool permanent = true);
 
     //~~~~~~ Decoders
     void decodePackets(an_decoder_t &an_decoder, const int &bytes_received);
-    void acknowledgeDecoder(an_packet_t* an_packet);
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
     void ecefPosRosDecoder(an_packet_t* an_packet);
