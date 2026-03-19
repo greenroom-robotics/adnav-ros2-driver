@@ -653,29 +653,81 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 			return;
 		}
 
+		const auto params = param_listener_->get_params();
+
 		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
 
-		stat.add("Orientation Filter Initialised", system_state_packet_->filter_status.b.orientation_filter_initialised ? "Yes" : "No");
-		stat.add("Navigation Filter Initialised", system_state_packet_->filter_status.b.ins_filter_initialised ? "Yes" : "No");
-		stat.add("Heading Initialised", system_state_packet_->filter_status.b.heading_initialised ? "Yes" : "No");
+		if (params.health.filters_initialised)
+		{
+			if (!system_state_packet_->filter_status.b.orientation_filter_initialised) {
+				stat.add("Orientation Filter", "Not Initialised");
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Orientation Filter not initialised");
+			}
+
+			if (!system_state_packet_->filter_status.b.ins_filter_initialised)
+			{
+				stat.add("Navigation Filter", "Not Initialised");
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Navigation Filter not initialised");
+			}
+
+			if (!system_state_packet_->filter_status.b.heading_initialised)
+			{
+				stat.add("Heading", "Not Initialised");
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Heading not initialised");
+			}
+		}
 
 		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
 		stat.add("GNSS Fix Status", to_string(gnss_fix));
+
+		if (params.health.gnss_fix && gnss_fix != GnssFixStatus::Fix3D)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No GNSS 3D Fix");
+		}
 
 		auto [rms_2d, rms_3d] = position_accuracy_rms(*system_state_packet_);
 		stat.add("Position Accuracy (2D RMS) (m)", std::to_string(rms_2d));
 		stat.add("Position Accuracy (3D RMS) (m)", std::to_string(rms_3d));
 
+		if (params.health.thresholds.position_accuracy_rms_2d != 0.0 && rms_2d > params.health.thresholds.position_accuracy_rms_2d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "2D Position RMS above threshold");
+		}
+		if (params.health.thresholds.position_accuracy_rms_3d != 0.0 && rms_3d > params.health.thresholds.position_accuracy_rms_3d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Position RMS above threshold");
+		}
+
 		if (euler_orientation_standard_deviation_packet_.has_value()) {
 			const auto orientation_deviation = orientation_accuracy_stdev(*euler_orientation_standard_deviation_packet_);
 			stat.add("Orientation Deviation (max of roll, pitch, yaw) (rads)", std::to_string(orientation_deviation));
+			if (params.health.thresholds.orientation_accuracy_stdev != 0.0 && orientation_deviation > params.health.thresholds.orientation_accuracy_stdev)
+			{
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Orientation stdev above threshold");
+			}
+		} else if (params.health.thresholds.orientation_accuracy_stdev != 0.0)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Cannot calculate Orientation stdev");
 		}
 
 		auto [vel_rms_2d, vel_rms_3d] = velocity_accuracy_rms(*velocity_standard_deviation_packet_);
 		stat.add("Velocity Accuracy (2D RMS) (m)", std::to_string(vel_rms_2d));
 		stat.add("Velocity Accuracy (3D RMS) (m)", std::to_string(vel_rms_3d));
 
-		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
+		if (params.health.thresholds.velocity_accuracy_rms_2d != 0.0 && vel_rms_2d > params.health.thresholds.velocity_accuracy_rms_2d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "2D Velocity RMS above threshold");
+		}
+
+		if (params.health.thresholds.velocity_accuracy_rms_3d != 0.0 && vel_rms_3d > params.health.thresholds.velocity_accuracy_rms_3d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Velocity RMS above threshold");
+		}
+
+		if (stat.level == diagnostic_msgs::msg::DiagnosticStatus::OK)
+		{
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
+		}
 	} else {
 		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet not received");
 	}

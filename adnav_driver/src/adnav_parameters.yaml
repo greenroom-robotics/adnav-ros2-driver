@@ -60,3 +60,38 @@ adnav:
     type: bool
     default_value: false
     description: "If true, use body velocity packet data instead of transforming state packet velocity."
+  health:
+    filters_initialised:
+      type: bool
+      default_value: true
+      description: "Require orientation, navigation and heading to be initialised."
+    gnss_fix:
+        type: bool
+        default_value: true
+        description: "Require a valid 3D GNSS fix for the device to be considered healthy."
+    thresholds:
+      position_accuracy_rms_2d:
+          type: double
+          default_value: 0.0
+          description: "Maximum acceptable 2D position accuracy (RMS) in meters for the device to be considered healthy. 0.0 means this check is disabled."
+          additional_constraints: '{"type": "number", "units": "meters"}'
+      position_accuracy_rms_3d:
+          type: double
+          default_value: 0.0
+          description: "Maximum acceptable 3D position accuracy (RMS) in meters for the device to be considered healthy. 0.0 means this check is disabled."
+          additional_constraints: '{"type": "number", "units": "meters"}'
+      velocity_accuracy_rms_2d:
+          type: double
+          default_value: 0.0
+          description: "Maximum acceptable 2D velocity accuracy (RMS) in meters per second for the device to be considered healthy. 0.0 means this check is disabled."
+          additional_constraints: '{"type": "number", "units": "metersPerSecond"}'
+      velocity_accuracy_rms_3d:
+        type: double
+        default_value: 0.0
+        description: "Maximum acceptable 3D velocity accuracy (RMS) in meters per second for the device to be considered healthy. 0.0 means this check is disabled."
+        additional_constraints: '{"type": "number", "units": "metersPerSecond"}'
+      orientation_accuracy_stdev:
+          type: double
+          default_value: 0.0
+          description: "Maximum acceptable orientation accuracy (standard deviation) in rads for the device to be considered healthy. 0.0 means this check is disabled."
+          additional_constraints: '{"type": "number", "units": "radians"}'
