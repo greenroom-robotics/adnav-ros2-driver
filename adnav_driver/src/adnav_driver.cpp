@@ -31,17 +31,16 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace adnav {
+
+
 /**
  * @brief Constructor for the Advanced Navigation Driver node
  *
  * This will create a Driver instance. Declare node parameters, setup threading groups and callbacks.
  * Initialize the log file, and open the communications to the device.
  */
-Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
+Driver::Driver(): rclcpp::Node("adnav_driver")
 {
-	// Set default values
-	memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
-
 	// ~~~~~~~~~~ Create the callback groups
 	// Callback group only for reading ANPP Packets
 	reading_group_ 		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -65,39 +64,178 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 		std::chrono::microseconds(params.publish_us), std::bind(&Driver::publishTimerCallback, this),
 		publishing_group_);
 
-	read_timer_ = this->create_wall_timer(
-		std::chrono::microseconds(params.read_us), std::bind(&Driver::recievePackets, this), reading_group_);
-
-	// Setup Services for the node
 	createServices();
 
 	// Open a new ANPP Log file for data logging
 	anpp_logger_.openFile("Log_", ".anpp", params.log_path);
 
-	// Open Communications with the device
-
-	adnav_connections_data_t comms_data {};
-	comms_data.method = params.comm_select;
-	comms_data.com_port = params.com_port;
-	comms_data.ip_address = params.ip_address;
-	comms_data.port = params.port;
-
-	communicator_ = std::make_unique<adnav::Communicator>(comms_data);
-	communicator_->open();
-
-	// Request device info with Packet 1 and 3
-	waitForDevicePacket();
-
-	// Create Publishers for the node
 	createPublishers();
 
-	// Send current setup of timer period, and packet periods to the device.
-	deviceSetup();
+	connection_thread_ = std::jthread([&](std::stop_token st){
+		auto loop = uvw::loop::get_default();
+
+		while (!st.stop_requested()) {
+			const auto _params = param_listener_->get_params();
+			auto dest = uvw::socket_address{_params.ip_address, static_cast<unsigned int>(_params.port)};
+
+			std::shared_ptr<uvw::tcp_handle> tcp_handle;
+			std::shared_ptr<uvw::udp_handle> udp_handle;
+
+			if (_params.comm_select == 1)
+			{
+				tcp_handle = loop->resource<uvw::tcp_handle>();
+			} else if (_params.comm_select == 3)
+			{
+				udp_handle = loop->resource<uvw::udp_handle>();
+			}
+
+			close_async_ = loop->resource<uvw::async_handle>();
+			close_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &async) {
+				// This fires on the loop thread — safe to close handles here
+				if (tcp_handle) {
+					tcp_handle->stop();
+				}
+				if (udp_handle) {
+					udp_handle->stop();
+				}
+				if (write_async_) {
+					write_async_->close();
+				}
+				async.close();  // close the async handle itself so the loop can exit
+			});
+
+			write_async_ = loop->resource<uvw::async_handle>();
+			write_async_->on<uvw::async_event>([&](const uvw::async_event &, uvw::async_handle &) {
+				std::unique_lock lock(write_q_mutex_);
+				while (!write_q_.empty()) {
+					auto [data, size] = std::move(write_q_.front());
+					write_q_.pop();
+					lock.unlock();
+					if (tcp_handle)
+					{
+						tcp_handle->write(std::move(data), size);
+					}
+					if (udp_handle)
+					{
+						udp_handle->send(dest, std::move(data), size);
+					}
+					lock.lock();
+				}
+			});
+
+			if (tcp_handle)
+			{
+				tcp_handle->on<uvw::error_event>([&](const uvw::error_event &err, uvw::tcp_handle &)
+				{
+					RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "TCP: Connection Error: %s - stopping", err.what());
+					failAllPendingReplies();
+					close_async_->send();
+				});
+
+				tcp_handle->on<uvw::end_event>([&](const uvw::end_event &, uvw::tcp_handle &) {
+					RCLCPP_INFO(rclcpp::get_logger("adnav_driver"), "TCP: End Event");
+					failAllPendingReplies();
+					close_async_->send();
+				});
+
+				tcp_handle->on<uvw::connect_event>([&](const uvw::connect_event &, uvw::tcp_handle &tcp) {
+					RCLCPP_INFO(this->get_logger(), "TCP: Connection established");
+					// tcp.keep_alive(true, uvw::tcp_handle::time{2});
+
+					if (const auto err = uv_tcp_keepalive_ex(tcp.raw(), 1, 1, 1, 2); err != 0) {
+						RCLCPP_ERROR(this->get_logger(), "Failed to set TCP keep-alive: %s", uv_strerror(err));
+						throw std::runtime_error("Failed to set TCP keep-alive");
+					}
+					tcp.read();
+
+					// Run setup in a separate thread so it can block on request-reply futures
+					// without stalling the event loop. join() is fast — failAllPendingReplies() will
+					// have unblocked any in-flight future before we reach here on reconnect.
+					if (setup_thread_.joinable()) setup_thread_.join();
+					setup_thread_ = std::jthread([this] {
+						requestDeviceInfo();
+						deviceSetup();
+					});
+				});
+
+				tcp_handle->on<uvw::data_event>([&](const uvw::data_event &event, uvw::tcp_handle &) {
+					std::span<const uint8_t> buffer(
+						reinterpret_cast<const uint8_t*>(event.data.get()), event.length);
+					RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes", buffer.size());
+					receivePackets(buffer);
+				});
+
+				RCLCPP_INFO(this->get_logger(), "TCP: Attempting to connect to %s:%ld", _params.ip_address.c_str(), _params.port);
+				tcp_handle->connect(dest);
+			}
+
+			if (udp_handle)
+			{
+				udp_handle->on<uvw::error_event>([&](const uvw::error_event &err, uvw::udp_handle &)
+				{
+					RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "UDP: Connection Error: %s - stopping", err.what());
+					failAllPendingReplies();
+					close_async_->send();
+				});
+
+				udp_handle->on<uvw::udp_data_event>([&](const uvw::udp_data_event &event, uvw::udp_handle &) {
+					std::span<const uint8_t> buffer(
+						reinterpret_cast<const uint8_t*>(event.data.get()), event.length);
+					RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes", buffer.size());
+					receivePackets(buffer);
+				});
+
+				udp_handle->bind(uvw::socket_address{_params.ip_address_local, static_cast<unsigned int>(_params.port)});
+				udp_handle->recv();
+
+				RCLCPP_INFO(this->get_logger(), "UDP: Created endpoint %s:%ld", _params.ip_address.c_str(), _params.port);
+
+				// Run setup in a separate thread so it can block on request-reply futures
+				// without stalling the event loop. join() is fast — failAllPendingReplies() will
+				// have unblocked any in-flight future before we reach here on reconnect.
+				if (setup_thread_.joinable()) setup_thread_.join();
+				setup_thread_ = std::jthread([this] {
+					if (!requestDeviceInfo())
+					{
+						RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "Did not get a Device Information reply - stopping");
+						close_async_->send();
+						return;
+					}
+					deviceSetup();
+				});
+			}
+
+			loop->run();
+			RCLCPP_DEBUG(this->get_logger(), "Event loop ended");
+
+			if (tcp_handle)
+			{
+				tcp_handle->close();
+			}
+
+			if (udp_handle)
+			{
+				udp_handle->close();
+			}
+
+			if (!st.stop_requested())
+			{
+				RCLCPP_ERROR(this->get_logger(), "Attempting reconnect in 2 seconds");
+				std::condition_variable_any cv;
+				std::mutex mtx;
+				std::stop_callback cb(st, [&]
+				{
+					cv.notify_all();
+				});
+				std::unique_lock lock(mtx);
+				cv.wait_for(lock, st, std::chrono::seconds(2), [&st]{ return st.stop_requested(); });
+			}
+		}
+	});
 
 	diagnostic_updater_->add("System Status", this, &Driver::system_status_diagnostic);
 	diagnostic_updater_->add("Filter Status", this, &Driver::filter_status_diagnostic);
-
-	RCLCPP_DEBUG(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
+	diagnostic_updater_->add("Accuracy", this, &Driver::accuracy_diagnostic);
 }
 
 /**
@@ -118,10 +256,11 @@ Driver::~Driver() {
 		rtcm_logger_.closeFile();
 	}
 
-	if (communicator_)
-	{
-		communicator_->close();
+	connection_thread_.request_stop();
+	if (close_async_) {
+		close_async_->send();  // ← thread-safe wakeup
 	}
+	connection_thread_.join();
 }
 
 rclcpp::Time time_from_state_packet(const system_state_packet_t& state_packet) {
@@ -139,59 +278,49 @@ rclcpp::Time time_from_state_packet(const system_state_packet_t& state_packet) {
 }
 
 /**
- * @brief Function to ask for device information from a Advanced navigation device and wait for its response.
- */
-void Driver::waitForDevicePacket() {
-	// initialize the decoder.
-	an_decoder_t an_decoder;
-	an_packet_t *an_packet;
-	an_decoder_initialise(&an_decoder);
-	bool recieved = false;
-	int bytes_received;
-
-	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
-
-	while(recieved == false && rclcpp::ok()) {
-		// Request the device to send the Device info packet.
-		requestDeviceInfo();
-
-		// Read in some data from the connection.
-		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
-
-		// Decode all data and act on only the device info data.
-		if (bytes_received > 0)
-		 {
-			anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), bytes_received);
-
-			// Increment the decode buffer length by the number of bytes received
-			an_decoder_increment(&an_decoder, bytes_received);
-
-			while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
-			 {
-				RCLCPP_DEBUG(this->get_logger(), "[WaitForDevicePacket]ID: %d", an_packet->id);
-
-				if(an_packet->id == packet_id_device_information) {
-					RCLCPP_DEBUG(this->get_logger(), "Received Device Information Packet (ANPP.3)");
-					deviceInfoDecoder(an_packet);
-					recieved = true;
-
-				}
-
-				// Ensure that you free the an_packet when your done with it or you will leak memory
-				an_packet_free(&an_packet);
-			}
-		}
-	}
-}
-
-/**
  * @brief Function to request a Advanced Navigation Devices info using ANPP.
  */
-void Driver::requestDeviceInfo() {
-	an_packet_t* an_packet;
+bool Driver::requestDeviceInfo() {
+	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
+	auto promise = std::make_shared<std::promise<device_information_packet_t>>();
+	auto future = promise->get_future();
 
-	an_packet = encode_request_packet(packet_id_device_information);
+	{
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_[packet_id_device_information] = {
+			[promise](an_packet_t* pkt) {
+				device_information_packet_t decoded_pkt{};
+				if (decode_device_information_packet(&decoded_pkt, pkt)) {
+					promise->set_exception(std::make_exception_ptr(
+						std::runtime_error("Decode error")));
+					return;
+				}
+				try { promise->set_value(decoded_pkt); } catch (const std::future_error&) {}
+			},
+			[promise](std::exception_ptr ep) {
+				try { promise->set_exception(ep); } catch (const std::future_error&) {}
+			}
+		};
+	}
+
+	an_packet_t* an_packet = encode_request_packet(packet_id_device_information);
 	encodeAndSend(an_packet);
+
+	if (future.wait_for(std::chrono::seconds(DEFAULT_TIMEOUT)) != std::future_status::ready) {
+		RCLCPP_ERROR(this->get_logger(), "Reply timeout for Device Information");
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_.erase(packet_id_device_information);
+		return false;
+	}
+
+	try {
+		[[maybe_unused]] const auto pkt = future.get();
+		return true;
+	} catch (const std::exception& e) {
+		// Promise was broken by failAllPendingReplies() — connection dropped mid-wait
+		RCLCPP_ERROR(this->get_logger(), "ACK aborted for Device Information: %s", e.what());
+		return false;
+	}
 }
 
 /**
@@ -243,14 +372,8 @@ void Driver::deviceSetup() {
 	RCLCPP_INFO(this->get_logger(), "Sending requested configuration to device:");
 
 	const auto params = param_listener_->get_params();
-
-	// Create and send a Packet Timer Period Packet.
-	acknowledge_recieve_ = true; // Since we are not waiting for device acknowledgement at startup
-	SendPacketTimer(params.packet_timer_period); // Will overwrite acknowledge_receive_ to false
-
-	// Since we are not waiting for device acknowledgement at startup
-	acknowledge_recieve_ = true;
-	SendPacketPeriods(getPacketRequest()); // Will overwrite acknowledge_receive_ to false.
+	SendPacketTimer(params.packet_timer_period);
+	SendPacketPeriods(getPacketRequest());
 }
 
 /**
@@ -276,12 +399,6 @@ void Driver::setupParamService() {
 					this,
 					std::placeholders::_1));
 
-	// read period updater callback
-	read_us_cb_ = param_handler_->add_parameter_callback("read_us",
-			std::bind(&Driver::updateReadUs,
-					this,
-					std::placeholders::_1));
-
 	// packet request updater callback
 	packet_request_cb_ = param_handler_->add_parameter_callback("packet_request",
 			std::bind(&Driver::updatePacketRequest,
@@ -304,16 +421,17 @@ void Driver::setupParamService() {
  *
  * This Function will also create a log file session and log incoming data to it.
  */
-void Driver::recievePackets() {
-	// initialize the decoder.
+void Driver::receivePackets(const std::span<const uint8_t> buffer) {
 	an_decoder_t an_decoder;
 	an_decoder_initialise(&an_decoder);
-	int bytes_received;
 
-	// get the bytes from the communication method, and load them into the decoder
-	bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+	// Copy incoming data into the decoder buffer
+	const auto buffer_bytes = std::min(buffer.size(), an_decoder_size(&an_decoder));
+	std::memcpy(an_decoder_pointer(&an_decoder), buffer.data(), buffer_bytes);
 
-	decodePackets(an_decoder, bytes_received);
+	anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), buffer_bytes);
+	an_decoder_increment(&an_decoder, buffer_bytes);
+	decodePackets(an_decoder, buffer_bytes);
 }
 
 /**
@@ -323,27 +441,13 @@ void Driver::recievePackets() {
  * Awaits a signal from a ROS Decoder method before publishing and accessing shared data.
  */
 void Driver::publishTimerCallback() {
-	// Since the messages can be filled in other threads ensure exclusive access.
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-
-	// Debug timekeeper value
-	rcl_time_point_value_t time = 0, diff = 0;
-
-	// Check for updates from other threads.
-	if(!msg_write_done_) {
-		time = this->get_clock().get()->now().nanoseconds();
-		// Only wait until timeout. otherwise log error and exit callback.
-		if (msg_cv_.wait_for(lock, std::chrono::milliseconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
-			RCLCPP_DEBUG(this->get_logger(), "Publish Timeout");
-			if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
-			RCLCPP_DEBUG(this->get_logger(), "PubTimeout:\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
-			return;
-		}
+	if (!write_async_ || !write_async_->active())
+	{
+		return;
 	}
 
-	// Debug message to show how long it waited to be awoken.
-	if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: L\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
+	// Since the messages can be filled in other threads ensure exclusive access.
+	std::unique_lock<std::mutex> lock(messages_mutex_);
 
 	// PUBLISH MESSAGES
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
@@ -359,11 +463,6 @@ void Driver::publishTimerCallback() {
 	pose_stamped_pub_->publish(pose_stamped_msg_);
 	geo_pose_pub_->publish(geo_pose_msg_);
 	geo_pose_stamped_pub_->publish(geo_pose_stamped_msg_);
-
-	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
-
-	// Restore the blocking flag before exiting the lock guard.
-	msg_write_done_ = false;
 }
 
 /**
@@ -379,22 +478,6 @@ void Driver::RestartPublisher() {
 	// Reset the timer using the class stored interval.
 	publish_timer_ = this->create_wall_timer(
       	std::chrono::microseconds(params.publish_us), std::bind(&Driver::publishTimerCallback, this), publishing_group_);
-}
-
-/**
- * @brief Function to cancel and restart the Reader timer.
- */
-void Driver::RestartReader() {
-	RCLCPP_INFO(this->get_logger(), "Restarting Reader Timer");
-
-	// Cancel old timer to stop callbacks from triggering while remaking timer.
-	read_timer_->cancel();
-
-	const auto params = param_listener_->get_params();
-
-	// Reset the timer using the class stored interval.
-	read_timer_ = this->create_wall_timer(
-		std::chrono::microseconds(params.read_us), std::bind(&Driver::recievePackets, this), reading_group_);
 }
 
 //~~~~~~ Diagnostic Functions
@@ -501,6 +584,8 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 			return;
 		}
 
+		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
 		stat.add("Orientation Filter Initialised", system_state_packet_->filter_status.b.orientation_filter_initialised ? "Yes" : "No");
 		stat.add("Navigation Filter Initialised", system_state_packet_->filter_status.b.ins_filter_initialised ? "Yes" : "No");
 		stat.add("Heading Initialised", system_state_packet_->filter_status.b.heading_initialised ? "Yes" : "No");
@@ -513,9 +598,136 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 		stat.add("External Velocity Active", system_state_packet_->filter_status.b.external_velocity_active ? "Yes" : "No");
 		stat.add("External Heading Active", system_state_packet_->filter_status.b.external_heading_active ? "Yes" : "No");
 
+		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
+		stat.add("GNSS Fix Status", to_string(gnss_fix));
+
 		// TODO parameters need to be added to inform what is considered abnormal operation
 
 		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
+	} else {
+		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet not received");
+	}
+}
+
+
+/**
+ * Calculate positional accuracy from the standard deviation values in the system state packet.
+ * @param state_packet
+ * @return double, double: 2D RMS, 3D RMS
+ */
+std::tuple<double, double> position_accuracy_rms(const system_state_packet_t& state_packet) {
+	const auto [x, y, z] = state_packet.standard_deviation;
+	return {
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2)),
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2) + std::pow(z, 2))
+	};
+}
+
+double orientation_accuracy_stdev(const euler_orientation_standard_deviation_packet_t& orientation_packet) {
+	const auto [roll_stdev, pitch_stdev, yaw_stdev] = orientation_packet.standard_deviation;
+	return std::max({roll_stdev, pitch_stdev, yaw_stdev});
+}
+
+/**
+ * Calculate velocity accuracy from the standard deviation values
+ * @param velocity_standard_deviation
+ * @return double, double: 2D RMS, 3D RMS
+ */
+	std::tuple<double, double> velocity_accuracy_rms(const velocity_standard_deviation_packet_t& velocity_standard_deviation) {
+	const auto [x, y, z] = velocity_standard_deviation.standard_deviation;
+	return {
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2)),
+		std::sqrt(std::pow(x, 2) + std::pow(y, 2) + std::pow(z, 2))
+	};
+}
+
+void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
+{
+	if (system_state_packet_.has_value())
+	{
+		auto last_rx_time = time_from_state_packet(system_state_packet_.value());
+
+		if (this->get_clock()->now() - last_rx_time < rclcpp::Duration(1, 0))
+		{
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet timeout");
+			return;
+		}
+
+		const auto params = param_listener_->get_params();
+
+		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
+		if (params.health.filters_initialised)
+		{
+			if (!system_state_packet_->filter_status.b.orientation_filter_initialised) {
+				stat.add("Orientation Filter", "Not Initialised");
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Orientation Filter not initialised");
+			}
+
+			if (!system_state_packet_->filter_status.b.ins_filter_initialised)
+			{
+				stat.add("Navigation Filter", "Not Initialised");
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Navigation Filter not initialised");
+			}
+
+			if (!system_state_packet_->filter_status.b.heading_initialised)
+			{
+				stat.add("Heading", "Not Initialised");
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Heading not initialised");
+			}
+		}
+
+		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
+		stat.add("GNSS Fix Status", to_string(gnss_fix));
+
+		if (params.health.gnss_fix && gnss_fix != GnssFixStatus::Fix3D)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No GNSS 3D Fix");
+		}
+
+		auto [rms_2d, rms_3d] = position_accuracy_rms(*system_state_packet_);
+		stat.add("Position Accuracy (2D RMS) (m)", std::to_string(rms_2d));
+		stat.add("Position Accuracy (3D RMS) (m)", std::to_string(rms_3d));
+
+		if (params.health.thresholds.position_accuracy_rms_2d != 0.0 && rms_2d > params.health.thresholds.position_accuracy_rms_2d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "2D Position RMS above threshold");
+		}
+		if (params.health.thresholds.position_accuracy_rms_3d != 0.0 && rms_3d > params.health.thresholds.position_accuracy_rms_3d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Position RMS above threshold");
+		}
+
+		if (euler_orientation_standard_deviation_packet_.has_value()) {
+			const auto orientation_deviation = orientation_accuracy_stdev(*euler_orientation_standard_deviation_packet_);
+			stat.add("Orientation Deviation (max of roll, pitch, yaw) (rads)", std::to_string(orientation_deviation));
+			if (params.health.thresholds.orientation_accuracy_stdev != 0.0 && orientation_deviation > params.health.thresholds.orientation_accuracy_stdev)
+			{
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Orientation stdev above threshold");
+			}
+		} else if (params.health.thresholds.orientation_accuracy_stdev != 0.0)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Cannot calculate Orientation stdev");
+		}
+
+		auto [vel_rms_2d, vel_rms_3d] = velocity_accuracy_rms(*velocity_standard_deviation_packet_);
+		stat.add("Velocity Accuracy (2D RMS) (m)", std::to_string(vel_rms_2d));
+		stat.add("Velocity Accuracy (3D RMS) (m)", std::to_string(vel_rms_3d));
+
+		if (params.health.thresholds.velocity_accuracy_rms_2d != 0.0 && vel_rms_2d > params.health.thresholds.velocity_accuracy_rms_2d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "2D Velocity RMS above threshold");
+		}
+
+		if (params.health.thresholds.velocity_accuracy_rms_3d != 0.0 && vel_rms_3d > params.health.thresholds.velocity_accuracy_rms_3d)
+		{
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Velocity RMS above threshold");
+		}
+
+		if (stat.level == diagnostic_msgs::msg::DiagnosticStatus::OK)
+		{
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
+		}
 	} else {
 		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet not received");
 	}
@@ -532,13 +744,8 @@ void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 void Driver::srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Request> request,
 		std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Response> response) {
 
-	// Send config to device.
-	SendPacketTimer(request->packet_timer_period, request->utc_synchronisation, request->permanent);
+	response->acknowledgement = SendPacketTimer(request->packet_timer_period, request->utc_synchronisation, request->permanent);
 
-	// Await the response.
-	response->acknowledgement = AcknowledgeHandler();
-
-	// notify of result.
 	char buf[15];
 	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
 	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
@@ -706,14 +913,10 @@ rcl_interfaces::msg::SetParametersResult Driver::ParamSetCallback(const std::vec
 
 		// Validation of parameters
 		// Only if they require validation
-		// Baud rate
-		if (parameter.get_name() == "baud_rate") result.reason += validateBaudRate(parameter).reason;
 		// comport
-		else if (parameter.get_name() == "com_port") result.reason += validateComPort(parameter).reason;
+		if (parameter.get_name() == "com_port") result.reason += validateComPort(parameter).reason;
 		// Publisher Interval Duration
 		else if (parameter.get_name() == "publish_us") result.reason += validatePublishUs(parameter).reason;
-		// Sensor Polling Interval Duration
-		else if (parameter.get_name() == "read_us") result.reason += validateReadUs(parameter).reason;
 		// Packet IDs and Rates
 		else if (parameter.get_name() == "packet_request") result.reason += validatePacketRequest(parameter).reason;
 		// Packet Timer Period
@@ -722,54 +925,6 @@ rcl_interfaces::msg::SetParametersResult Driver::ParamSetCallback(const std::vec
 
 	if(result.reason != "") {
 		result.successful = false;
-	}
-	return result;
-}
-
-/**
- * @brief Function to validate the proposed parameter change to the Baud Rate parameter.
- *
- * @param parameter const rclcpp::Parameter. proposed change to the Baud Rate parameter.
- * @return returns a SetParametersResult message containing a success value and a string descriptor.
- */
-rcl_interfaces::msg::SetParametersResult Driver::validateBaudRate(const rclcpp::Parameter& parameter) {
-	rcl_interfaces::msg::SetParametersResult result;
-	result.reason = "";
-	result.successful = true;
-
-	// Stringstream to stream in faults.
-	std::stringstream ss;
-
-	// Guard for parameter type
-	if(parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
-		result.successful = false;
-		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
-	}
-
-	// test for valid baudrate
-	switch(parameter.as_int())
-	 {
-		case    2400 : 	break;
-		case    4800 : 	break;
-		case    9600 : 	break;
-		case   19200 : 	break;
-		case   38400 : 	break;
-		case   57600 : 	break;
-		case  115200 : 	break;
-		case  230400 : 	break;
-		case  460800 : 	break;
-		case  500000 : 	break;
-		case  576000 : 	break;
-		case  921600 : 	break;
-		case 1000000 : 	break;
-		case 2000000 : 	break;
-		default      : 	result.successful = false;
-						ss << "\n[Error] Invalid Baud Rate\n";
-					   	break;
-	}
-
-	if(!result.successful)	 {
-		result.reason = ss.str();
 	}
 	return result;
 }
@@ -820,12 +975,6 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePublishUs(const rclcpp:
 		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
 	}
 
-	// Guard for less than read_us
-	if(parameter.as_int() < this->get_parameter("read_us").as_int()) {
-		result.successful = false;
-		ss << "\n[Error] Publish period must be greater than or equal to read period\n";
-	}
-
 	// Guard for timer range
 	if(parameter.as_int() < 1000 || parameter.as_int() > 1000000) {
 		result.successful = false;
@@ -846,58 +995,6 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePublishUs(const rclcpp:
  */
 void Driver::updatePublishUs([[maybe_unused]] const rclcpp::Parameter& parameter) {
 	RestartPublisher();
-}
-
-/**
- * @brief Function to validate the proposed parameter change to the Read us parameter.
- *
- * @param parameter const rclcpp::Parameter. proposed change to the Read us parameter.
- * @return returns a SetParametersResult message containing a success value and a string descriptor.
- */
-rcl_interfaces::msg::SetParametersResult Driver::validateReadUs(const rclcpp::Parameter& parameter) {
-	rcl_interfaces::msg::SetParametersResult result;
-	result.reason = "";
-	result.successful = true;
-
-	// Stringstream to stream in faults.
-	std::stringstream ss;
-
-	// Guard for parameter type
-	if(parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
-		result.successful = false;
-		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
-	}
-
-	// Guard for timer range
-	if(parameter.as_int() < 1000 || parameter.as_int() > 1000000) {
-		result.successful = false;
-		ss << "\n[Error] Read Period " << parameter.as_int() << " is invalid. Out of range.";
-	}
-
-	// Ensure that the publish timer is not lower than the new read period.
-	try
-	 {
-		if(parameter.as_int() > this->get_parameter("publish_us").as_int()) {
-			result.successful = false;
-			ss << "[Error] Publish Period (" << this->get_parameter("publish_us").as_int() <<
-				") is less than requested read period (" << parameter.as_int() << ").\n";
-		}
-	} // This catch will be thrown on startup as read is initialized period to publish.
-	catch(const rclcpp::exceptions::ParameterNotDeclaredException& e) {}
-
-	if(!result.successful)	 {
-		result.reason = ss.str();
-	}
-	return result;
-}
-
-/**
- * @brief Function to Update the Read us parameter, create temporary service client and update node timer using service
- *
- * @param parameter const rclcpp::Parameter. updated Read us parameter
- */
-void Driver::updateReadUs([[maybe_unused]] const rclcpp::Parameter& parameter) {
-	RestartReader();
 }
 
 /**
@@ -965,12 +1062,22 @@ std::vector<adnav_interfaces::msg::PacketPeriod> Driver::getPacketRequest() {
 	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
 	const auto params = param_listener_->get_params();
 
-	// Create and fill a periods format.
-	for(std::size_t i = 0; (i+i) < params.packet_request.size(); i++) {
-		adnav_interfaces::msg::PacketPeriod period;
-		period.packet_id = params.packet_request[i+i];
-		period.packet_period = params.packet_request[i+i+1];
-		packet_periods.push_back(period);
+	if (params.send_packet_periods)
+	{
+		for (const auto& pkt : REQUIRED_PACKETS)
+		{
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = pkt.packet_id;
+			period.packet_period = pkt.period.count();
+			packet_periods.push_back(period);
+		}
+
+		for (std::size_t i = 0; (i+i) < params.additional_packet_request.size(); i++) {
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = params.additional_packet_request[i+i];
+			period.packet_period = params.additional_packet_request[i+i+1];
+			packet_periods.push_back(period);
+		}
 	}
 	return packet_periods;
 }
@@ -1168,43 +1275,96 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
  */
 void Driver::encodeAndSend(an_packet_t* an_packet) {
 	an_packet_encode(an_packet);
-	// Send encoded packet through the selected communication medium
-	communicator_->write(an_packet_pointer(an_packet), an_packet_size(an_packet));
-	// Free the packet to avoid memory leaks
+
+	const auto size = static_cast<unsigned int>(an_packet_size(an_packet));
+	auto data = std::make_unique<char[]>(size);
+	std::memcpy(data.get(), an_packet_pointer(an_packet), size);
 	an_packet_free(&an_packet);
+
+	{
+		std::lock_guard lock(write_q_mutex_);
+		write_q_.push({std::move(data), size});
+	}
+	write_async_->send();
 }
 
 /**
- * @brief Function to handle the acknowledgement of configuration from a device in a thread safe manner.
+ * @brief Register a pending reply for the acknowledge of @p an_packet, send it,
+ *        then block until the device replies or @c DEFAULT_TIMEOUT seconds elapse.
  *
- * Needs to interact with the reading thread to receive the packet. Uses a conditional variable to flag when a
- * packet has been received.
+ * Uses pending_replies_ keyed on packet_id_acknowledge, so any caller can use the
+ * same mechanism to await any other packet type by registering their own PendingReply.
  *
- * @return Raw Acknowledge Message
+ * Thread-safe: may be called from any thread (e.g. setup_thread_ or a ROS service thread).
+ * The actual TCP write is always dispatched onto the event loop via write_async_.
+ *
+ * @param an_packet Encoded ANPP packet whose reply we are waiting for.
+ * @return RawAcknowledge message; result field is 0xFF on timeout or connection drop.
  */
-adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
-	// make acknowledgement data structure
-	adnav_interfaces::msg::RawAcknowledge msg;
+adnav_interfaces::msg::RawAcknowledge Driver::sendAndAwaitAck(an_packet_t* an_packet) {
+	const uint8_t packet_id = an_packet->id;
 
-	// Wait for an acknowledge packet to be received.
-	std::unique_lock<std::mutex> lock(acknowledge_mutex_);
-	if(!acknowledge_recieve_) {
-		if(srv_cv_.wait_for(lock, std::chrono::seconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
-			RCLCPP_ERROR(this->get_logger(), "acknowledgement Timeout");
-			msg.result++; // make error condition
-			return msg;
-		}
+	auto promise = std::make_shared<std::promise<acknowledge_packet_t>>();
+	std::future<acknowledge_packet_t> future = promise->get_future();
+
+	// Register BEFORE sending to avoid a race where the ack arrives before the entry exists.
+	{
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_[packet_id_acknowledge] = {
+			[promise](an_packet_t* pkt) {
+				acknowledge_packet_t ack{};
+				if (decode_acknowledge_packet(&ack, pkt)) {
+					promise->set_exception(std::make_exception_ptr(
+						std::runtime_error("Decode error")));
+					return;
+				}
+				try { promise->set_value(ack); } catch (const std::future_error&) {}
+			},
+			[promise](std::exception_ptr ep) {
+				try { promise->set_exception(ep); } catch (const std::future_error&) {}
+			}
+		};
 	}
 
-	// acknowledge_packet_
-	msg.id  = acknowledge_packet_.packet_id;
-	msg.crc = acknowledge_packet_.packet_crc;
-	msg.result = acknowledge_packet_.acknowledge_result;
+	encodeAndSend(an_packet);
 
-	// reset condition variable.
-	acknowledge_recieve_ = false;
+	adnav_interfaces::msg::RawAcknowledge msg;
+
+	if (future.wait_for(std::chrono::seconds(DEFAULT_TIMEOUT)) != std::future_status::ready) {
+		RCLCPP_ERROR(this->get_logger(), "ACK timeout for packet %d", packet_id);
+		std::lock_guard lock(pending_replies_mutex_);
+		pending_replies_.erase(packet_id_acknowledge);
+		msg.result = 0xFF;
+		return msg;
+	}
+
+	try {
+		const auto pkt = future.get();
+		msg.id     = pkt.packet_id;
+		msg.crc    = pkt.packet_crc;
+		msg.result = pkt.acknowledge_result;
+	} catch (const std::exception& e) {
+		// Promise was broken by failAllPendingReplies() — connection dropped mid-wait
+		RCLCPP_ERROR(this->get_logger(), "ACK aborted for packet %d: %s", packet_id, e.what());
+		msg.result = 0xFF;
+	}
 
 	return msg;
+}
+
+/**
+ * @brief Fail all in-flight pending replies with an exception.
+ *
+ * Called on disconnect (error_event / end_event) so that any thread blocked in
+ * sendAndAwaitAck() or any other future.get() unblocks immediately.
+ */
+void Driver::failAllPendingReplies() {
+	auto ep = std::make_exception_ptr(std::runtime_error("Connection lost"));
+	std::lock_guard lock(pending_replies_mutex_);
+	for (auto& [id, reply] : pending_replies_) {
+		reply.on_cancel(ep);
+	}
+	pending_replies_.clear();
 }
 
 /**
@@ -1216,7 +1376,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
  * @return acknowledgement Message
  */
 adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_period, bool utc_sync, bool permanent) {
-	RCLCPP_DEBUG_STREAM(this->get_logger(), "Incoming Packet Timer Request:\nUTC Sync: " <<
+	RCLCPP_DEBUG_STREAM(this->get_logger(), "Sending Packet Timer Request:\nUTC Sync: " <<
 		(utc_sync ? "True\n":"False\n") <<
 		"\tPermanent: " << (permanent ? "True\n":"False\n") <<
 		"\tPeriod (μs): " << packet_timer_period << "\n");
@@ -1233,13 +1393,10 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_p
 	packet_timer_period_packet.utc_synchronisation = utc_sync;
 	packet_timer_period_packet.packet_timer_period = packet_timer_period;
 
-	// Send the packet.
+	// Send the packet and block until the device acknowledges or timeout.
 	RCLCPP_INFO(this->get_logger(), "Sending Packet Timer Request to device.");
 	an_packet = encode_packet_timer_period_packet(&packet_timer_period_packet);
-	encodeAndSend(an_packet);
-
-	// Return the acknowledgement result.
-	return AcknowledgeHandler();
+	return sendAndAwaitAck(an_packet);
 }
 
 /**
@@ -1253,7 +1410,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_p
 adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
 	bool clear_existing, bool permanent) {
 	std::stringstream ss;
-	ss << "incoming Packet Request:\nClear: " << (clear_existing ? "True\n":"False\n") <<
+	ss << "Sending Packet Request:\nClear: " << (clear_existing ? "True\n":"False\n") <<
 		"Permanent: " << (permanent ? "True\n":"False\n") <<
 		"Number Requested: " << periods.size() << std::endl;
 
@@ -1280,9 +1437,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vecto
 
 	RCLCPP_INFO(this->get_logger(), "Sending Packet Periods Request to device.");
 	an_packet = encode_packet_periods_packet(&packet_periods_packet);
-	encodeAndSend(an_packet);
-
-	return AcknowledgeHandler();
+	return sendAndAwaitAck(an_packet);
 }
 
 //~~~~~~ Decoders
@@ -1297,22 +1452,17 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 	// If there are bytes to be decoded.
 	an_packet_t* an_packet;
 	if (bytes > 0) {
-
-		anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), bytes);
-		// Increment the decode buffer length by the number of bytes received
-		an_decoder_increment(&an_decoder, bytes);
-
 		// Decode all the packets in the buffer
+		std::unique_lock<std::mutex> lock(messages_mutex_);
+
 		while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
 		 {
-			RCLCPP_DEBUG(this->get_logger(), "ID: %d", an_packet->id);
+			RCLCPP_DEBUG(this->get_logger(), "RX Packet IDs %hhu", an_packet->id);
 
+			bool handled = true;
 			switch (an_packet->id)
 			 {
 			case packet_id_device_information: deviceInfoDecoder(an_packet);
-				break;
-
-			case packet_id_acknowledge: acknowledgeDecoder(an_packet);
 				break;
 
 			case packet_id_system_state: systemStateRosDecoder(an_packet);
@@ -1322,6 +1472,16 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				break;
 
 			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
+				break;
+
+			case packet_id_euler_orientation_standard_deviation:
+				euler_orientation_standard_deviation_packet_.emplace();
+				decode_euler_orientation_standard_deviation_packet(&*euler_orientation_standard_deviation_packet_, an_packet);
+				break;
+
+			case packet_id_velocity_standard_deviation:
+				velocity_standard_deviation_packet_.emplace();
+				decode_velocity_standard_deviation_packet(&*velocity_standard_deviation_packet_, an_packet);
 				break;
 
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
@@ -1336,39 +1496,34 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				break;
 
 			default:
-				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
-					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
+				handled = false;
 				break;
 			}
+
+			// Generic pending reply dispatch — fires for any packet_id registered in pending_replies_.
+			// Runs alongside named case handlers, so both can fire for the same packet (e.g. device info
+			// is always decoded above AND can also satisfy a request-reply future registered below).
+			{
+				std::unique_lock reply_lock(pending_replies_mutex_);
+				auto it = pending_replies_.find(an_packet->id);
+				if (it != pending_replies_.end()) {
+					auto cb = std::move(it->second.on_packet);
+					pending_replies_.erase(it);
+					reply_lock.unlock();
+					cb(an_packet);
+					handled = true;
+				}
+			}
+
+			if (!handled) {
+				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
+					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
+			}
+
 			// Ensure that you free the an_packet when your done with it or you will leak memory
 			an_packet_free(&an_packet);
-		} // while an_packet != NULL
-	}// if bytes > 0
-}
-
-/**
- * @brief Function to decode a acknowledgement packet and notify relevant services.
- *
- * @param an_packet pointer to a an_packet_t object from which to decode the information.
- */
-void Driver::acknowledgeDecoder(an_packet_t* an_packet) {
-	// worker thread gets lock
-	std::unique_lock<std::mutex> lock(acknowledge_mutex_);
-
-	// Decode packet and warn if error.
-	if(decode_acknowledge_packet(&acknowledge_packet_, an_packet))
-	 {
-		RCLCPP_WARN(this->get_logger(), "Error decoding Acknowledge Packet");
+		}
 	}
-
-	RCLCPP_DEBUG(this->get_logger(), "acknowledgement received.\nID: %d\nResult: %d\n",
-		acknowledge_packet_.packet_id, acknowledge_packet_.acknowledge_result);
-
-	// Set the acknowledgement received to true
-	acknowledge_recieve_ = true;
-
-	// Notify the service thread
-	srv_cv_.notify_one();
 }
 
 /**
@@ -1443,10 +1598,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	const auto params = param_listener_->get_params();
 	system_state_packet_t system_state_packet;
 	std::stringstream ss;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: L\tAccess: %d", P20_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
 	if(decode_system_state_packet(&system_state_packet, an_packet) == 0)
 	 {
@@ -1558,11 +1709,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 				RCLCPP_INFO(this->get_logger(), "Event 1 Occurred.");
 			}
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P20_num_++, diff/1000);
 }
 
 /**
@@ -1576,11 +1722,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 	ecef_position_packet_t ecef_position_packet;
 
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: L\tAccess: %d", P33_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
-
 	// ECEF Position (in meters) Packet for Pose Message
 	if(decode_ecef_position_packet(&ecef_position_packet, an_packet) == 0)
 	 {
@@ -1588,12 +1729,6 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 		pose_msg_.position.y = ecef_position_packet.position[1];
 		pose_msg_.position.z = ecef_position_packet.position[2];
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P33_num_++, diff/1000);
 }
 
 /**
@@ -1606,10 +1741,6 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
  */
 void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
 	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27: \tMutex: L\tAccess: %d", P27_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
 	if(decode_quaternion_orientation_standard_deviation_packet(&quaternion_orientation_standard_deviation_packet, an_packet) == 0)
 	 {
@@ -1618,12 +1749,6 @@ void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
 		imu_msg_.orientation_covariance[4] = quaternion_orientation_standard_deviation_packet.standard_deviation[1];
 		imu_msg_.orientation_covariance[8] = quaternion_orientation_standard_deviation_packet.standard_deviation[2];
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P27_num_++, diff/1000);
 }
 
 /**
@@ -1636,12 +1761,6 @@ void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
  */
 void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 	raw_sensors_packet_t raw_sensors_packet;
-
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-
-	RCLCPP_DEBUG(this->get_logger(), "Packet 28: \tMutex: L\tAccess: %d", P28_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
 	// Fill the messages
 	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
@@ -1670,20 +1789,12 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
 
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);
 }
 
 void Driver::bodyVelRosDecoder(an_packet_t *an_packet)
 {
 	body_velocity_packet_t body_velocity_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	// Debug timekeeper
+
 	auto stamp_time = this->get_clock().get()->now();
 
 	if (decode_body_velocity_packet(&body_velocity_packet, an_packet) == 0)
@@ -1695,16 +1806,11 @@ void Driver::bodyVelRosDecoder(an_packet_t *an_packet)
 		twist_stamped_msg_.header.frame_id = frame_id_;
 		twist_stamped_msg_.twist = twist_msg_;
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
 }
 
 void Driver::extBodyVelRosDecoder(an_packet_t *an_packet)
 {
 	external_body_velocity_packet_t external_body_velocity_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	// Debug timekeeper
 	auto stamp_time = this->get_clock().get()->now();
 
 	if (decode_external_body_velocity_packet(&external_body_velocity_packet, an_packet) == 0)
@@ -1715,8 +1821,6 @@ void Driver::extBodyVelRosDecoder(an_packet_t *an_packet)
 		twist_stamped_msg_external_body.header.stamp = stamp_time;
 		twist_stamped_msg_external_body.header.frame_id = external_frame_id_;
 	}
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
 }
 
 }// namespace adnav

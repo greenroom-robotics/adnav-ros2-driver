@@ -7,7 +7,7 @@ if(NOT CMAKE_C_STANDARD)
 endif()
 
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD 23)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -32,9 +32,10 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(adnav_interfaces REQUIRED)
 find_package(generate_parameter_library REQUIRED)
+find_package(libuv REQUIRED)
+find_package(uvw REQUIRED)
 
 
-# Build
 include_directories(
   include/adnav_driver
   ../an-ros-common/include
@@ -69,10 +70,10 @@ generate_parameter_library(
         adnav_parameters
         src/adnav_parameters.yaml
 )
-target_link_libraries(${PROJECT_NAME}_lib adnav_parameters)
+target_link_libraries(${PROJECT_NAME}_lib adnav_parameters uvw::uvw libuv::uv_a)
 
 add_executable(${EXECUTABLE_NAME} src/main.cpp)
-target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib)
+target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib uvw::uvw libuv::uv_a)
 ament_target_dependencies(${EXECUTABLE_NAME} ${DEPENDENCIES})
 
 install(TARGETS ${EXECUTABLE_NAME}
