@@ -26,29 +26,33 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#pragma once
+
 #ifndef ADVANCED_NAVIGATION_DRIVER_H
 #define ADVANCED_NAVIGATION_DRIVER_H
 
-// C System Headers
-#include <stdio.h>      // FILE
+#include <cstdio>
 #include <fstream>
 
 // C++ System Headers
-#include <chrono>       // Time, std::chrono
-#include <functional>   // std::placeholder
-#include <memory>       // smart pointers
-#include <vector>       // std::vector
-#include <string>       // std::string
-#include <mutex>        // std::mutex, std:unique_lock
-#include <condition_variable>   // std::condition_variable
+#include <chrono>           // Time, std::chrono
+#include <memory>           // smart pointers
+#include <vector>           // std::vector
+#include <string>           // std::string
+#include <mutex>            // std::mutex, std::unique_lock
+#include <future>           // std::promise, std::future
+#include <queue>            // std::queue
+#include <unordered_map>    // std::unordered_map
+#include <thread>
 
-#include <rs232.h>
 #include <an_packet_protocol.h>
 #include <ins_packets.h>
-#include <adnav_utils.h>
-#include <adnav_comms.h>
 #include <adnav_logger.h>
 #include <adnav_ntrip.h>
+
+#include "anpp.hpp"
+
+#include "uvw.hpp"
 
 #include <adnav_driver/adnav_parameters.hpp>
 
@@ -78,45 +82,32 @@
 #include <geographic_msgs/msg/geo_pose.hpp>
 #include <geographic_msgs/msg/geo_pose_stamped.hpp>
 
-#if defined(WIN32) || defined(_WIN32)
-    #pragma comment(lib, "ws2_32.lib")  // Winsock Library
-    #pragma comment(lib, "iphlpapi.lib")  // IP Help API Library
-    #include<winsock2.h>
-    #include<iphlpapi.h>
-    #include<netioapi.h>
-    #include<WS2tcpip.h>
-#else
-    #include <unistd.h>
-    #include <netdb.h>
-    #include <ifaddrs.h>
-    #include <sys/socket.h>
-    #include <arpa/inet.h>
-#endif
-
-#define _USE_MATH_DEFINES
-#include <math.h>
 #include <cmath>
 
 
 namespace adnav {
 
-constexpr const double RADIANS_TO_DEGREES = (180.0/M_PI);
-constexpr const int    DEFAULT_BAUD_RATE = 115200;
-constexpr const int    DEFAULT_TIMER_PERIOD = 20000;
-constexpr const int    DEFAULT_PACKET_TIMER_PERIOD = 10000;
-constexpr const char * DEFAULT_COM_PORT = "ttyUSB0";
-constexpr const int    DEFAULT_PACKET_REQUEST[4] = {20, 10, 28, 10};
-constexpr const char * DEFAULT_PACKET_REQUEST_STR = "20, 10, 28, 10";
-constexpr const char * DEFAULT_IP_ADDRESS = "0.0.0.0";
-constexpr const bool   DEFAULT_NTRIP_STATE = false;
-constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
-constexpr const int    DEFAULT_TIMEOUT = 5;
-constexpr const int    MAX_TIMER_PERIOD = 65535;
-constexpr const int    MIN_TIMER_PERIOD = 1000;
-constexpr const int    MIN_PACKET_PERIOD = 1;
-constexpr const int    MAX_PACKET_PERIOD = 65535;
-constexpr const int    MIN_PORT = 0;
-constexpr const int    MAX_PORT = 65535;
+    struct PacketIdTime {
+        uint8_t packet_id;
+        std::chrono::microseconds period;
+    };
+
+    inline constexpr std::array<PacketIdTime, 5> REQUIRED_PACKETS = {
+        {
+            {packet_id_system_state, std::chrono::microseconds(50)},
+            {packet_id_raw_sensors, std::chrono::microseconds(50)},
+            {packet_id_body_velocity, std::chrono::microseconds(50)},
+            {packet_id_euler_orientation_standard_deviation, std::chrono::microseconds(50)},
+            {packet_id_velocity_standard_deviation, std::chrono::microseconds(50)}
+        }};
+
+constexpr double RADIANS_TO_DEGREES = (180.0/M_PI);
+constexpr int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
+constexpr int    DEFAULT_TIMEOUT = 2;
+constexpr int    MAX_TIMER_PERIOD = 65535;
+constexpr int    MIN_TIMER_PERIOD = 1000;
+constexpr int    MIN_PACKET_PERIOD = 1;
+constexpr int    MAX_PACKET_PERIOD = 65535;
 
 typedef struct {
     bool en;
@@ -126,19 +117,15 @@ typedef struct {
     std::string username;
     std::string password;
     std::string mountpoint;
-}ntrip_client_state_t;
+} ntrip_client_state_t;
 
-class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a pointer to the node.
+class Driver : public rclcpp::Node
 {
  public:
-    // ~~~~ Constructors
     Driver();
-    ~Driver();
+    ~Driver() override;
 
  private:
-    // Debug variables
-    int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P27_num_ = 0, P33_num_ = 0, P0_num_ = 0;
-
     std::shared_ptr<adnav::ParamListener> param_listener_;
 
     // String to hold frame_id
@@ -146,16 +133,24 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::string external_frame_id_ = "map";
 
     // device communication settings
-    std::unique_ptr<adnav::Communicator> communicator_;
+    std::jthread connection_thread_;
+    std::jthread setup_thread_;                     // runs deviceSetup() off the event loop
+    std::shared_ptr<uvw::async_handle> close_async_;
+    std::shared_ptr<uvw::async_handle> write_async_;
+
+    // Write queue — encodeAndSend pushes here; write_async_ drains it on the loop thread
+    std::mutex write_q_mutex_;
+    std::queue<std::pair<std::unique_ptr<char[]>, unsigned int>> write_q_;
 
     // Log files.
     adnav::Logger anpp_logger_;
     adnav::Logger rtcm_logger_;
 
     // ANPP Packet variables
-    acknowledge_packet_t acknowledge_packet_;  // only access with protection of acknowledge_mutex_
     std::optional<device_information_packet_t> device_information_packet_;
     std::optional<system_state_packet_t> system_state_packet_;
+    std::optional<euler_orientation_standard_deviation_packet_t> euler_orientation_standard_deviation_packet_;
+    std::optional<velocity_standard_deviation_packet_t> velocity_standard_deviation_packet_;
 
     // Msgs. Only access with protection of messages_mutex_
     tf2::Quaternion                 orientation_;
@@ -202,13 +197,11 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     OnSetParametersCallbackHandle::SharedPtr param_set_cb_;
     std::shared_ptr<rclcpp::ParameterEventHandler> param_handler_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> publish_us_cb_;
-    std::shared_ptr<rclcpp::ParameterCallbackHandle> read_us_cb_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> packet_request_cb_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> packet_timer_cb_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr publish_timer_;
-    rclcpp::TimerBase::SharedPtr read_timer_;
 
     // Service Handlers
     rclcpp::Service<adnav_interfaces::srv::PacketTimerPeriod>::SharedPtr packet_period_timer_srv_;
@@ -218,12 +211,16 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     // Threading variables
     std::mutex messages_mutex_;
-    std::condition_variable msg_cv_;
-    bool msg_write_done_;
 
-    std::mutex acknowledge_mutex_;
-    std::condition_variable srv_cv_;
-    bool acknowledge_recieve_;
+    // Pending request-reply tracking. Keyed by the expected reply packet_id.
+    // Works for any packet type — register a PendingReply before sending, and
+    // decodePackets will dispatch it when that packet_id arrives.
+    struct PendingReply {
+        std::function<void(an_packet_t*)>       on_packet;  // called on the loop thread with the reply
+        std::function<void(std::exception_ptr)> on_cancel;  // called when the connection drops
+    };
+    std::mutex pending_replies_mutex_;
+    std::unordered_map<uint8_t, PendingReply> pending_replies_;
 
     // NTRIP Variables
     std::unique_ptr<adnav::ntrip::Client> ntrip_client_;
@@ -235,22 +232,22 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     //~~~~~~~~~~~~~~~~~~~~~ Private Methods.
 
     //~~~~~~ Setup Functions
-    void waitForDevicePacket();
-    void requestDeviceInfo();
+    bool requestDeviceInfo();
+    void deviceSetup();
+
     void createPublishers();
     void createServices();
-    void deviceSetup();
     void setupParamService();
 
     //~~~~~~ Control Functions
-    void recievePackets();
+    void receivePackets(std::span<const uint8_t> buffer);
     void publishTimerCallback();
     void RestartPublisher();
-    void RestartReader();
 
     //~~~~~~ Logging Functions
     void system_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
     void filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
+    void accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat);
 
     //~~~~~~ ROS Services
     void srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Request> request,
@@ -261,12 +258,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     //~~~~~~ Parameter Functions
     std::vector<adnav_interfaces::msg::PacketPeriod> getPacketRequest();
     rcl_interfaces::msg::SetParametersResult ParamSetCallback(const std::vector<rclcpp::Parameter>& Params);
-    rcl_interfaces::msg::SetParametersResult validateBaudRate(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validateComPort(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePublishUs(const rclcpp::Parameter& parameter);
     void updatePublishUs(const rclcpp::Parameter& parameter);
-    rcl_interfaces::msg::SetParametersResult validateReadUs(const rclcpp::Parameter& parameter);
-    void updateReadUs(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePacketRequest(const rclcpp::Parameter& parameter);
     void updatePacketRequest(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePacketTimer(const rclcpp::Parameter& parameter);
@@ -280,14 +274,14 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     //~~~~~~ Device Communication Functions
     void encodeAndSend(an_packet_t* an_packet);
-    adnav_interfaces::msg::RawAcknowledge AcknowledgeHandler();
+    adnav_interfaces::msg::RawAcknowledge sendAndAwaitAck(an_packet_t* an_packet);
+    void failAllPendingReplies();
     adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true , bool permanent = true);
     adnav_interfaces::msg::RawAcknowledge SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
         bool clear_existing = true, bool permanent = true);
 
     //~~~~~~ Decoders
     void decodePackets(an_decoder_t &an_decoder, const int &bytes_received);
-    void acknowledgeDecoder(an_packet_t* an_packet);
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
     void ecefPosRosDecoder(an_packet_t* an_packet);
