@@ -21,6 +21,7 @@
   <depend>adnav_interfaces</depend>
 
   <build_depend>generate_parameter_library</build_depend>
+  <build_depend>uvw_vendor</build_depend>
 
   <!-- <test_depend>ament_lint_auto</test_depend> -->
   <test_depend>ament_cmake_cpplint</test_depend>

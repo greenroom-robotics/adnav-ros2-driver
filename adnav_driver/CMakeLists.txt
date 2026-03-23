@@ -32,8 +32,8 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(adnav_interfaces REQUIRED)
 find_package(generate_parameter_library REQUIRED)
-find_package(libuv REQUIRED)
 find_package(uvw REQUIRED)
+
 
 
 include_directories(
@@ -70,10 +70,10 @@ generate_parameter_library(
         adnav_parameters
         src/adnav_parameters.yaml
 )
-target_link_libraries(${PROJECT_NAME}_lib adnav_parameters uvw::uvw libuv::uv_a)
+target_link_libraries(${PROJECT_NAME}_lib adnav_parameters uvw::uvw)
 
 add_executable(${EXECUTABLE_NAME} src/main.cpp)
-target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib uvw::uvw libuv::uv_a)
+target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib uvw::uvw)
 ament_target_dependencies(${EXECUTABLE_NAME} ${DEPENDENCIES})
 
 install(TARGETS ${EXECUTABLE_NAME}
