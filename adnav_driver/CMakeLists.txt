@@ -34,10 +34,7 @@ find_package(adnav_interfaces REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(uvw REQUIRED)
 
-
-
 include_directories(
-  include/adnav_driver
   ../an-ros-common/include
 )
 
@@ -78,11 +75,6 @@ ament_target_dependencies(${EXECUTABLE_NAME} ${DEPENDENCIES})
 
 install(TARGETS ${EXECUTABLE_NAME}
   DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  DIRECTORY include/
-  DESTINATION include
 )
 
 if(BUILD_TESTING)
