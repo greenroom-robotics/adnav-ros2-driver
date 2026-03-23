@@ -28,7 +28,7 @@ jobs:
       package: ${{ inputs.package }}
       build_kilted: ${{ inputs.build_kilted }}
       build_iron: ${{ inputs.build_iron }}
-      package_dir: packages
+      package_dir: .
       public: false
     secrets:
       token: ${{ secrets.API_TOKEN_GITHUB }}
