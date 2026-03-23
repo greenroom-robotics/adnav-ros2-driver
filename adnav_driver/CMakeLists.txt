@@ -98,5 +98,4 @@ if(BUILD_TESTING)
   ament_cpplint()
 endif()
 
-ament_export_include_directories(include)
 ament_package()
