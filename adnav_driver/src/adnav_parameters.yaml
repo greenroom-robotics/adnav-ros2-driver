@@ -68,6 +68,10 @@ adnav:
         type: bool
         default_value: true
         description: "Require a valid 3D GNSS fix for the device to be considered healthy."
+    external_velocity:
+      type: bool
+      default_value: false
+      description: "Require the External Velocity Active flag, i.e. DVL signal is valid."
     thresholds:
       position_accuracy_rms_2d:
           type: double

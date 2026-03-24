@@ -682,6 +682,15 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No GNSS 3D Fix");
 		}
 
+		if (params.health.external_velocity)
+		{
+			stat.add("External Velocity Active", system_state_packet_->filter_status.b.external_velocity_active ? "Yes" : "No");
+			if (!system_state_packet_->filter_status.b.external_velocity_active)
+			{
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No External Velocity");
+			}
+		}
+
 		auto [rms_2d, rms_3d] = position_accuracy_rms(*system_state_packet_);
 		stat.add("Position Accuracy (2D RMS) (m)", std::to_string(rms_2d));
 		stat.add("Position Accuracy (3D RMS) (m)", std::to_string(rms_3d));
