@@ -42,9 +42,6 @@ namespace adnav {
 Driver::Driver(): rclcpp::Node("adnav_driver")
 {
 	// ~~~~~~~~~~ Create the callback groups
-	// Callback group only for reading ANPP Packets
-	reading_group_ 		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-
 	// Multithreaded group for publishing ROS messages
 	publishing_group_	= this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
@@ -81,10 +78,10 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 			std::shared_ptr<uvw::tcp_handle> tcp_handle;
 			std::shared_ptr<uvw::udp_handle> udp_handle;
 
-			if (_params.comm_select == 1)
+			if (_params.connection_type == "tcp-client")
 			{
 				tcp_handle = loop->resource<uvw::tcp_handle>();
-			} else if (_params.comm_select == 3)
+			} else if (_params.connection_type == "udp")
 			{
 				udp_handle = loop->resource<uvw::udp_handle>();
 			}

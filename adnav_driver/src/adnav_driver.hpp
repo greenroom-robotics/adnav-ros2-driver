@@ -190,7 +190,6 @@ class Driver : public rclcpp::Node
     // Callback groups Allows the callbacks to be processed on a different thread by
     // the Multithread executor.
     rclcpp::CallbackGroup::SharedPtr publishing_group_;
-    rclcpp::CallbackGroup::SharedPtr reading_group_;
     rclcpp::CallbackGroup::SharedPtr service_group_;
 
     // Parameter callbacks and handlers

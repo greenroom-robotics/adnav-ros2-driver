@@ -28,12 +28,11 @@ adnav:
     type: int
     default_value: 1000
     description: "Integer value for Packet Timing Period in μs"
-  comm_select:
-    type: int
-    default_value: 0
-    description: "Method of communication with the device. 0: Serial, 1: TCP Client, 2: TCP Server, 3: UDP Client, 4: CAN"
+  connection_type:
+    type: string
+    description: "Connection type to the Advanced Navigation device: Can be 'serial', 'tcp-client' or 'udp'"
     validation:
-      one_of<>: [[0, 1, 2, 3, 4]]
+      one_of<>: [["serial", "tcp-client", "udp"]]
   ip_address:
     type: string
     default_value: ""
