@@ -68,6 +68,10 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 
 	createPublishers();
 
+	system_state_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
+	euler_orientation_standard_deviation_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
+	velocity_standard_deviation_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
+
 	connection_thread_ = std::jthread([&](std::stop_token st){
 		auto loop = uvw::loop::get_default();
 
@@ -182,10 +186,17 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 					receivePackets(buffer);
 				});
 
-				udp_handle->bind(uvw::socket_address{_params.ip_address_local, static_cast<unsigned int>(_params.port)});
+				// determine the correct local address to listen on
+				udp_handle->connect(dest);
+				auto local_addr = udp_handle->sock();
+				local_addr.port = static_cast<unsigned int>(_params.port);
+				udp_handle->disconnect();
+
+				udp_handle->bind(local_addr);
 				udp_handle->recv();
 
-				RCLCPP_INFO(this->get_logger(), "UDP: Created endpoint %s:%ld", _params.ip_address.c_str(), _params.port);
+				RCLCPP_INFO(this->get_logger(), "UDP: Created %s:%u --> endpoint %s:%u", local_addr.ip.c_str(), local_addr.port,
+					dest.ip.c_str(), dest.port);
 
 				// Run setup in a separate thread so it can block on request-reply futures
 				// without stalling the event loop. join() is fast — failAllPendingReplies() will
@@ -233,6 +244,7 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 	diagnostic_updater_->add("System Status", this, &Driver::system_status_diagnostic);
 	diagnostic_updater_->add("Filter Status", this, &Driver::filter_status_diagnostic);
 	diagnostic_updater_->add("Accuracy", this, &Driver::accuracy_diagnostic);
+	diagnostic_updater_->add("Packets", this, &Driver::packets_diagnostic);
 }
 
 /**
@@ -325,19 +337,19 @@ bool Driver::requestDeviceInfo() {
  */
 void Driver::createPublishers() {
 	// Creating the ROS2 Publishers
-	imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("~/imu", 10);
-	imu_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("~/imu_raw", 10);
-	nav_sat_fix_pub_ = this->create_publisher<sensor_msgs::msg::NavSatFix>("~/nav_sat_fix", 10);
-	magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>("~/magnetic_field", 10);
-	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>("~/barometric_pressure", 10);
-	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>("~/temperature", 10);
-	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("~/twist", 10);
-	twist_stamped_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("~/twist_stamped", 10);
-	twist_stamped_external_body_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("~/twist_stamped_external_body", 10);
-	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("~/pose", 10);
-	pose_stamped_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("~/pose_stamped", 10);
-	geo_pose_pub_ = this->create_publisher<geographic_msgs::msg::GeoPose>("~/geopose", 10);
-	geo_pose_stamped_pub_ = this->create_publisher<geographic_msgs::msg::GeoPoseStamped>("~/geopose_stamped", 10);
+	imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu", 10);
+	imu_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu_raw", 10);
+	nav_sat_fix_pub_ = this->create_publisher<sensor_msgs::msg::NavSatFix>("nav_sat_fix", 10);
+	magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>("magnetic_field", 10);
+	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>("barometric_pressure", 10);
+	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>("temperature", 10);
+	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("twist", 10);
+	twist_stamped_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped", 10);
+	twist_stamped_external_body_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped_external_body", 10);
+	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("pose", 10);
+	pose_stamped_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose_stamped", 10);
+	geo_pose_pub_ = this->create_publisher<geographic_msgs::msg::GeoPose>("geopose", 10);
+	geo_pose_stamped_pub_ = this->create_publisher<geographic_msgs::msg::GeoPoseStamped>("geopose_stamped", 10);
 }
 
 /**
@@ -370,7 +382,7 @@ void Driver::deviceSetup() {
 
 	const auto params = param_listener_->get_params();
 	SendPacketTimer(params.packet_timer_period);
-	SendPacketPeriods(getPacketRequest());
+	SendPacketPeriods(getPacketRequest(), params.override_existing_packets);
 }
 
 /**
@@ -481,79 +493,72 @@ void Driver::RestartPublisher() {
 
 void Driver::system_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
 {
-	if (system_state_packet_.has_value())
+	const auto sys_state_pkt = system_state_packet_.value();
+	if (sys_state_pkt)
 	{
-		auto last_rx_time = time_from_state_packet(system_state_packet_.value());
-
-		if (this->get_clock()->now() - last_rx_time < rclcpp::Duration(1, 0))
-		{
-			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet timeout");
-			return;
-		}
-
 		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
 
-		if (system_state_packet_->system_status.b.system_failure) {
+		if (sys_state_pkt->system_status.b.system_failure) {
 			stat.add("System", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.accelerometer_sensor_failure) {
+		if (sys_state_pkt->system_status.b.accelerometer_sensor_failure) {
 			stat.add("Accelerometer", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.gyroscope_sensor_failure) {
+		if (sys_state_pkt->system_status.b.gyroscope_sensor_failure) {
 			stat.add("Gyroscope", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.magnetometer_sensor_failure) {
+		if (sys_state_pkt->system_status.b.magnetometer_sensor_failure) {
 			stat.add("Magnetometer", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.pressure_sensor_failure) {
+		if (sys_state_pkt->system_status.b.pressure_sensor_failure) {
 			stat.add("Pressure Sensor", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.gnss_failure) {
+		if (sys_state_pkt->system_status.b.gnss_failure) {
 			stat.add("GNSS", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.accelerometer_over_range) {
+		if (sys_state_pkt->system_status.b.accelerometer_over_range) {
 			stat.add("Accelerometer Over Range", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.gyroscope_over_range) {
+		if (sys_state_pkt->system_status.b.gyroscope_over_range) {
 			stat.add("Gyroscope Over Range", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.magnetometer_over_range) {
+		if (sys_state_pkt->system_status.b.magnetometer_over_range) {
 			stat.add("Magnetometer", " Over Range");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.pressure_over_range) {
+		if (sys_state_pkt->system_status.b.pressure_over_range) {
 			stat.add("Pressure Sensor", " Over Range");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.minimum_temperature_alarm) {
+		if (sys_state_pkt->system_status.b.minimum_temperature_alarm) {
 			stat.add("Temperature Alarm", "Minimum Temperature Alarm");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.maximum_temperature_alarm) {
+		if (sys_state_pkt->system_status.b.maximum_temperature_alarm) {
 			stat.add("Temperature Alarm", "Maximum Temperature Alarm");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.internal_data_logging_error) {
+		if (sys_state_pkt->system_status.b.internal_data_logging_error) {
 			stat.add("Data Logging", "Internal Error");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.high_voltage_alarm) {
+		if (sys_state_pkt->system_status.b.high_voltage_alarm) {
 			stat.add("Power Supply", "High Voltage Alarm");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.gnss_antenna_fault) {
+		if (sys_state_pkt->system_status.b.gnss_antenna_fault) {
 			stat.add("GNSS Antenna", "Fault Detected");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (system_state_packet_->system_status.b.serial_port_overflow_alarm) {
+		if (sys_state_pkt->system_status.b.serial_port_overflow_alarm) {
 			stat.add("Serial Port", "Data Overflow");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
@@ -565,47 +570,71 @@ void Driver::system_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System Failure Detected");
 		}
 	} else {
-		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet not received");
+		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, std::format("System State packet: {}", to_string(sys_state_pkt.error())));
 	}
 }
 
 void Driver::filter_status_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
 {
-	if (system_state_packet_.has_value())
-	{
-		auto last_rx_time = time_from_state_packet(system_state_packet_.value());
-
-		if (this->get_clock()->now() - last_rx_time < rclcpp::Duration(1, 0))
-		{
-			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet timeout");
-			return;
-		}
-
+	const auto sys_state_pkt = system_state_packet_.value();
+	if (sys_state_pkt) {
 		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
 
-		stat.add("Orientation Filter Initialised", system_state_packet_->filter_status.b.orientation_filter_initialised ? "Yes" : "No");
-		stat.add("Navigation Filter Initialised", system_state_packet_->filter_status.b.ins_filter_initialised ? "Yes" : "No");
-		stat.add("Heading Initialised", system_state_packet_->filter_status.b.heading_initialised ? "Yes" : "No");
-		stat.add("UTC Time Initialised", system_state_packet_->filter_status.b.utc_time_initialised ? "Yes" : "No");
-		stat.add("Internal GNSS Enabled", system_state_packet_->filter_status.b.internal_gnss_enabled ? "Yes" : "No");
-		stat.add("Dual Antenna Heading Active", system_state_packet_->filter_status.b.dual_antenna_heading_active ? "Yes" : "No");
-		stat.add("Velocity Heading Enabled", system_state_packet_->filter_status.b.velocity_heading_enabled ? "Yes" : "No");
-		stat.add("Atmospheric Altitude Enabled", system_state_packet_->filter_status.b.atmospheric_altitude_enabled ? "Yes" : "No");
-		stat.add("External Position Active", system_state_packet_->filter_status.b.external_position_active ? "Yes" : "No");
-		stat.add("External Velocity Active", system_state_packet_->filter_status.b.external_velocity_active ? "Yes" : "No");
-		stat.add("External Heading Active", system_state_packet_->filter_status.b.external_heading_active ? "Yes" : "No");
+		stat.add("Orientation Filter Initialised", sys_state_pkt->filter_status.b.orientation_filter_initialised ? "Yes" : "No");
+		stat.add("Navigation Filter Initialised", sys_state_pkt->filter_status.b.ins_filter_initialised ? "Yes" : "No");
+		stat.add("Heading Initialised", sys_state_pkt->filter_status.b.heading_initialised ? "Yes" : "No");
+		stat.add("UTC Time Initialised", sys_state_pkt->filter_status.b.utc_time_initialised ? "Yes" : "No");
+		stat.add("Internal GNSS Enabled", sys_state_pkt->filter_status.b.internal_gnss_enabled ? "Yes" : "No");
+		stat.add("Dual Antenna Heading Active", sys_state_pkt->filter_status.b.dual_antenna_heading_active ? "Yes" : "No");
+		stat.add("Velocity Heading Enabled", sys_state_pkt->filter_status.b.velocity_heading_enabled ? "Yes" : "No");
+		stat.add("Atmospheric Altitude Enabled", sys_state_pkt->filter_status.b.atmospheric_altitude_enabled ? "Yes" : "No");
+		stat.add("External Position Active", sys_state_pkt->filter_status.b.external_position_active ? "Yes" : "No");
+		stat.add("External Velocity Active", sys_state_pkt->filter_status.b.external_velocity_active ? "Yes" : "No");
+		stat.add("External Heading Active", sys_state_pkt->filter_status.b.external_heading_active ? "Yes" : "No");
 
-		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
+		const auto gnss_fix = static_cast<GnssFixStatus>(sys_state_pkt->filter_status.b.gnss_fix_type);
 		stat.add("GNSS Fix Status", to_string(gnss_fix));
 
 		// TODO parameters need to be added to inform what is considered abnormal operation
 
 		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
 	} else {
-		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet not received");
+		stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, std::format("System State packet: {}", to_string(sys_state_pkt.error())));
 	}
 }
 
+	void Driver::packets_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
+{
+	stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
+	auto packets = getPacketRequest();
+
+	for (const auto& packet: packets)
+	{
+		const auto packet_name = packet_id_to_string(static_cast<packet_id_e>(packet.packet_id)).value_or("Packet ID " + std::to_string(packet.packet_id));
+
+		if (packet_receive_times.contains(packet.packet_id))
+		{
+			auto last_rx_time = packet_receive_times[packet.packet_id];
+			auto time_since_last = this->get_clock()->now() - last_rx_time;
+			stat.add(std::format("{} ({}) - Last Seen (ms)", packet_name, packet.packet_id), std::to_string(time_since_last.nanoseconds() / 1e6));
+
+			if (time_since_last > rclcpp::Duration(1, 0))
+			{
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, std::format("{} stale", packet_name).c_str());
+			}
+		} else
+		{
+			stat.add(std::format("{} ({}) - Last Seen (ms)", packet_name, packet.packet_id), "Never");
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, std::format("{} packet never received", packet_name).c_str());
+		}
+
+		if (stat.level == diagnostic_msgs::msg::DiagnosticStatus::OK)
+		{
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK");
+		}
+	}
+}
 
 /**
  * Calculate positional accuracy from the standard deviation values in the system state packet.
@@ -640,41 +669,34 @@ double orientation_accuracy_stdev(const euler_orientation_standard_deviation_pac
 
 void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &stat)
 {
-	if (system_state_packet_.has_value())
+	const auto sys_state_pkt = system_state_packet_.value();
+	if (sys_state_pkt)
 	{
-		auto last_rx_time = time_from_state_packet(system_state_packet_.value());
-
-		if (this->get_clock()->now() - last_rx_time < rclcpp::Duration(1, 0))
-		{
-			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "System State packet timeout");
-			return;
-		}
-
 		const auto params = param_listener_->get_params();
 
 		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
 
 		if (params.health.filters_initialised)
 		{
-			if (!system_state_packet_->filter_status.b.orientation_filter_initialised) {
+			if (!sys_state_pkt->filter_status.b.orientation_filter_initialised) {
 				stat.add("Orientation Filter", "Not Initialised");
 				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Orientation Filter not initialised");
 			}
 
-			if (!system_state_packet_->filter_status.b.ins_filter_initialised)
+			if (!sys_state_pkt->filter_status.b.ins_filter_initialised)
 			{
 				stat.add("Navigation Filter", "Not Initialised");
 				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Navigation Filter not initialised");
 			}
 
-			if (!system_state_packet_->filter_status.b.heading_initialised)
+			if (!sys_state_pkt->filter_status.b.heading_initialised)
 			{
 				stat.add("Heading", "Not Initialised");
 				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Heading not initialised");
 			}
 		}
 
-		const auto gnss_fix = static_cast<GnssFixStatus>(system_state_packet_->filter_status.b.gnss_fix_type);
+		const auto gnss_fix = static_cast<GnssFixStatus>(sys_state_pkt->filter_status.b.gnss_fix_type);
 		stat.add("GNSS Fix Status", to_string(gnss_fix));
 
 		if (params.health.gnss_fix && gnss_fix != GnssFixStatus::Fix3D)
@@ -684,14 +706,14 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 
 		if (params.health.external_velocity)
 		{
-			stat.add("External Velocity Active", system_state_packet_->filter_status.b.external_velocity_active ? "Yes" : "No");
-			if (!system_state_packet_->filter_status.b.external_velocity_active)
+			stat.add("External Velocity Active", sys_state_pkt->filter_status.b.external_velocity_active ? "Yes" : "No");
+			if (!sys_state_pkt->filter_status.b.external_velocity_active)
 			{
 				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No External Velocity");
 			}
 		}
 
-		auto [rms_2d, rms_3d] = position_accuracy_rms(*system_state_packet_);
+		auto [rms_2d, rms_3d] = position_accuracy_rms(*sys_state_pkt);
 		stat.add("Position Accuracy (2D RMS) (m)", std::to_string(rms_2d));
 		stat.add("Position Accuracy (3D RMS) (m)", std::to_string(rms_3d));
 
@@ -704,8 +726,9 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Position RMS above threshold");
 		}
 
-		if (euler_orientation_standard_deviation_packet_.has_value()) {
-			const auto orientation_deviation = orientation_accuracy_stdev(*euler_orientation_standard_deviation_packet_);
+		const auto euler_stddev_pkt = euler_orientation_standard_deviation_packet_.value();
+		if (euler_stddev_pkt) {
+			const auto orientation_deviation = orientation_accuracy_stdev(*euler_stddev_pkt);
 			stat.add("Orientation Deviation (max of roll, pitch, yaw) (rads)", std::to_string(orientation_deviation));
 			if (params.health.thresholds.orientation_accuracy_stdev != 0.0 && orientation_deviation > params.health.thresholds.orientation_accuracy_stdev)
 			{
@@ -713,21 +736,28 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 			}
 		} else if (params.health.thresholds.orientation_accuracy_stdev != 0.0)
 		{
-			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Cannot calculate Orientation stdev");
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, std::format("Euler Orientation Stddev packet: {}", to_string(euler_stddev_pkt.error())));
 		}
 
-		auto [vel_rms_2d, vel_rms_3d] = velocity_accuracy_rms(*velocity_standard_deviation_packet_);
-		stat.add("Velocity Accuracy (2D RMS) (m)", std::to_string(vel_rms_2d));
-		stat.add("Velocity Accuracy (3D RMS) (m)", std::to_string(vel_rms_3d));
-
-		if (params.health.thresholds.velocity_accuracy_rms_2d != 0.0 && vel_rms_2d > params.health.thresholds.velocity_accuracy_rms_2d)
+		const auto velocity_stddev_pkt = velocity_standard_deviation_packet_.value();
+		if (velocity_stddev_pkt)
 		{
-			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "2D Velocity RMS above threshold");
-		}
+			auto [vel_rms_2d, vel_rms_3d] = velocity_accuracy_rms(*velocity_stddev_pkt);
+			stat.add("Velocity Accuracy (2D RMS) (m)", std::to_string(vel_rms_2d));
+			stat.add("Velocity Accuracy (3D RMS) (m)", std::to_string(vel_rms_3d));
 
-		if (params.health.thresholds.velocity_accuracy_rms_3d != 0.0 && vel_rms_3d > params.health.thresholds.velocity_accuracy_rms_3d)
+			if (params.health.thresholds.velocity_accuracy_rms_2d != 0.0 && vel_rms_2d > params.health.thresholds.velocity_accuracy_rms_2d)
+			{
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "2D Velocity RMS above threshold");
+			}
+
+			if (params.health.thresholds.velocity_accuracy_rms_3d != 0.0 && vel_rms_3d > params.health.thresholds.velocity_accuracy_rms_3d)
+			{
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Velocity RMS above threshold");
+			}
+		} else if (params.health.thresholds.velocity_accuracy_rms_2d != 0.0 || params.health.thresholds.velocity_accuracy_rms_3d != 0.0)
 		{
-			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "3D Velocity RMS above threshold");
+			stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, std::format("Velocity Standard Deviation packet: {}", to_string(velocity_stddev_pkt.error())));
 		}
 
 		if (stat.level == diagnostic_msgs::msg::DiagnosticStatus::OK)
@@ -1070,11 +1100,11 @@ std::vector<adnav_interfaces::msg::PacketPeriod> Driver::getPacketRequest() {
 
 	if (params.send_packet_periods)
 	{
-		for (const auto& pkt : REQUIRED_PACKETS)
+		for (const auto pkt_id : REQUIRED_PACKETS)
 		{
 			adnav_interfaces::msg::PacketPeriod period;
-			period.packet_id = pkt.packet_id;
-			period.packet_period = pkt.period.count();
+			period.packet_id = pkt_id;
+			period.packet_period = params.default_packet_period;
 			packet_periods.push_back(period);
 		}
 
@@ -1220,11 +1250,8 @@ void Driver::getDataFromHostStr(const std::string& host) {
 
 	ntrip_state_.ip = std::string(ip);
 
-
 	// Get the Port from the string
 	ntrip_state_.port = atoi(split_string.back().c_str());
-
-	return;
 }
 
 /**
@@ -1461,6 +1488,8 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 		// Decode all the packets in the buffer
 		std::unique_lock<std::mutex> lock(messages_mutex_);
 
+		auto buffer_ts = now();
+
 		while ((an_packet = an_packet_decode(&an_decoder)) != nullptr)
 		 {
 			RCLCPP_DEBUG(this->get_logger(), "RX Packet IDs %hhu", an_packet->id);
@@ -1481,14 +1510,20 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				break;
 
 			case packet_id_euler_orientation_standard_deviation:
-				euler_orientation_standard_deviation_packet_.emplace();
-				decode_euler_orientation_standard_deviation_packet(&*euler_orientation_standard_deviation_packet_, an_packet);
-				break;
+				{
+					euler_orientation_standard_deviation_packet_t pkt;
+					decode_euler_orientation_standard_deviation_packet(&pkt, an_packet);
+					euler_orientation_standard_deviation_packet_ = pkt;
+					break;
+				}
 
 			case packet_id_velocity_standard_deviation:
-				velocity_standard_deviation_packet_.emplace();
-				decode_velocity_standard_deviation_packet(&*velocity_standard_deviation_packet_, an_packet);
-				break;
+				{
+					velocity_standard_deviation_packet_t pkt;
+					decode_velocity_standard_deviation_packet(&pkt, an_packet);
+					velocity_standard_deviation_packet_ = pkt;
+					break;
+				}
 
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
@@ -1505,6 +1540,8 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				handled = false;
 				break;
 			}
+
+			packet_receive_times.insert_or_assign(an_packet->id, buffer_ts);
 
 			// Generic pending reply dispatch — fires for any packet_id registered in pending_replies_.
 			// Runs alongside named case handlers, so both can fire for the same packet (e.g. device info
