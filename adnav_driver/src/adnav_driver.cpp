@@ -69,6 +69,7 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 	createPublishers();
 
 	system_state_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
+	raw_sensors_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
 	euler_orientation_standard_deviation_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
 	velocity_standard_deviation_packet_.set_lifespan(std::chrono::microseconds(params.publish_us * 3));
 
@@ -77,7 +78,9 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 
 		while (!st.stop_requested()) {
 			const auto _params = param_listener_->get_params();
-			auto dest = uvw::socket_address{_params.ip_address, static_cast<unsigned int>(_params.port)};
+			auto resolver = loop->resource<uvw::get_addr_info_req>();
+
+			uvw::socket_address dest;
 
 			std::shared_ptr<uvw::tcp_handle> tcp_handle;
 			std::shared_ptr<uvw::udp_handle> udp_handle;
@@ -128,13 +131,13 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 			{
 				tcp_handle->on<uvw::error_event>([&](const uvw::error_event &err, uvw::tcp_handle &)
 				{
-					RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "TCP: Connection Error: %s - stopping", err.what());
+					RCLCPP_ERROR(this->get_logger(), "TCP: Connection Error: %s - stopping", err.what());
 					failAllPendingReplies();
 					close_async_->send();
 				});
 
 				tcp_handle->on<uvw::end_event>([&](const uvw::end_event &, uvw::tcp_handle &) {
-					RCLCPP_INFO(rclcpp::get_logger("adnav_driver"), "TCP: End Event");
+					RCLCPP_INFO(this->get_logger(), "TCP: End Event");
 					failAllPendingReplies();
 					close_async_->send();
 				});
@@ -166,15 +169,25 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 					receivePackets(buffer);
 				});
 
-				RCLCPP_INFO(this->get_logger(), "TCP: Attempting to connect to %s:%ld", _params.ip_address.c_str(), _params.port);
-				tcp_handle->connect(dest);
+				auto resolved_addr = resolver->node_addr_info_sync(_params.ip_address.c_str());
+				if (!resolved_addr.first)
+				{
+					RCLCPP_ERROR(this->get_logger(), "Could not resolve hostname: %s.", _params.ip_address.c_str());
+					close_async_->send();
+				} else
+				{
+					dest = uvw::details::sock_addr(*resolved_addr.second->ai_addr);
+					dest.port = static_cast<unsigned int>(_params.port);
+					RCLCPP_INFO(this->get_logger(), "TCP: Attempting to connect to %s:%u", dest.ip.c_str(), dest.port);
+					tcp_handle->connect(dest);
+				}
 			}
 
 			if (udp_handle)
 			{
 				udp_handle->on<uvw::error_event>([&](const uvw::error_event &err, uvw::udp_handle &)
 				{
-					RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "UDP: Connection Error: %s - stopping", err.what());
+					RCLCPP_ERROR(this->get_logger(), "UDP: Connection Error: %s - stopping", err.what());
 					failAllPendingReplies();
 					close_async_->send();
 				});
@@ -186,31 +199,42 @@ Driver::Driver(): rclcpp::Node("adnav_driver")
 					receivePackets(buffer);
 				});
 
-				// determine the correct local address to listen on
-				udp_handle->connect(dest);
-				auto local_addr = udp_handle->sock();
-				local_addr.port = static_cast<unsigned int>(_params.port);
-				udp_handle->disconnect();
+				auto resolved_addr = resolver->node_addr_info_sync(_params.ip_address.c_str());
+				if (!resolved_addr.first)
+				{
+					RCLCPP_ERROR(this->get_logger(), "Could not resolve hostname: %s.", _params.ip_address.c_str());
+					close_async_->send();
+				} else
+				{
+					dest = uvw::details::sock_addr(*resolved_addr.second->ai_addr);
+					dest.port = static_cast<unsigned int>(_params.port);
 
-				udp_handle->bind(local_addr);
-				udp_handle->recv();
+					// determine the correct local address to listen on
+					udp_handle->connect(dest);
+					auto local_addr = udp_handle->sock();
+					local_addr.port = static_cast<unsigned int>(_params.port);
+					udp_handle->disconnect();
 
-				RCLCPP_INFO(this->get_logger(), "UDP: Created %s:%u --> endpoint %s:%u", local_addr.ip.c_str(), local_addr.port,
-					dest.ip.c_str(), dest.port);
+					udp_handle->bind(local_addr);
+					udp_handle->recv();
 
-				// Run setup in a separate thread so it can block on request-reply futures
-				// without stalling the event loop. join() is fast — failAllPendingReplies() will
-				// have unblocked any in-flight future before we reach here on reconnect.
-				if (setup_thread_.joinable()) setup_thread_.join();
-				setup_thread_ = std::jthread([this] {
-					if (!requestDeviceInfo())
-					{
-						RCLCPP_ERROR(rclcpp::get_logger("adnav_driver"), "Did not get a Device Information reply - stopping");
-						close_async_->send();
-						return;
-					}
-					deviceSetup();
-				});
+					RCLCPP_INFO(this->get_logger(), "UDP: Created %s:%u --> endpoint %s:%u", local_addr.ip.c_str(), local_addr.port,
+						dest.ip.c_str(), dest.port);
+
+					// Run setup in a separate thread so it can block on request-reply futures
+					// without stalling the event loop. join() is fast — failAllPendingReplies() will
+					// have unblocked any in-flight future before we reach here on reconnect.
+					if (setup_thread_.joinable()) setup_thread_.join();
+					setup_thread_ = std::jthread([this] {
+						if (!requestDeviceInfo())
+						{
+							RCLCPP_ERROR(this->get_logger(), "Did not get a Device Information reply - stopping");
+							close_async_->send();
+							return;
+						}
+						deviceSetup();
+					});
+				}
 			}
 
 			loop->run();
@@ -272,18 +296,28 @@ Driver::~Driver() {
 	connection_thread_.join();
 }
 
-rclcpp::Time time_from_state_packet(const system_state_packet_t& state_packet) {
-	// Create a ROS time from the system state packet timestamp
-	auto sec = state_packet.unix_time_seconds;
-	auto nanosecs = state_packet.microseconds * 1000;
+rclcpp::Time time_from_seconds_microseconds(uint32_t seconds, uint32_t microseconds) {
+	auto nanosecs = microseconds * 1000;
 
 	// Handle possible rollover of nanoseconds
 	if (nanosecs >= 1000000000) {
-		sec += nanosecs / 1000000000;
+		seconds += nanosecs / 1000000000;
 		nanosecs = nanosecs % 1000000000;
 	}
 
-	return {static_cast<int32_t>(sec), nanosecs, RCL_ROS_TIME};
+	return {static_cast<int32_t>(seconds), nanosecs, RCL_ROS_TIME};
+}
+
+rclcpp::Duration duration_from_seconds_microseconds(uint32_t seconds, uint32_t microseconds) {
+	auto nanosecs = microseconds * 1000;
+
+	// Handle possible rollover of nanoseconds
+	if (nanosecs >= 1000000000) {
+		seconds += nanosecs / 1000000000;
+		nanosecs = nanosecs % 1000000000;
+	}
+
+	return {static_cast<int32_t>(seconds), nanosecs};
 }
 
 /**
@@ -336,20 +370,34 @@ bool Driver::requestDeviceInfo() {
  * @brief Function to declare topics and publishers for the adnav_driver node.
  */
 void Driver::createPublishers() {
-	// Creating the ROS2 Publishers
-	imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu", 10);
-	imu_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu_raw", 10);
+	const auto params = param_listener_->get_params();
+
+	// Following packets are derived from system state
 	nav_sat_fix_pub_ = this->create_publisher<sensor_msgs::msg::NavSatFix>("nav_sat_fix", 10);
-	magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>("magnetic_field", 10);
-	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>("barometric_pressure", 10);
-	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>("temperature", 10);
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("twist", 10);
 	twist_stamped_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped", 10);
-	twist_stamped_external_body_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped_external_body", 10);
-	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("pose", 10);
-	pose_stamped_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose_stamped", 10);
 	geo_pose_pub_ = this->create_publisher<geographic_msgs::msg::GeoPose>("geopose", 10);
 	geo_pose_stamped_pub_ = this->create_publisher<geographic_msgs::msg::GeoPoseStamped>("geopose_stamped", 10);
+	imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu", 10);
+
+	if (params.additional_packets.raw_sensors)
+	{
+		imu_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu_raw", 10);
+		magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>("magnetic_field", 10);
+		barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>("barometric_pressure", 10);
+		temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>("temperature", 10);
+	}
+
+	if (params.additional_packets.external_body_velocity)
+	{
+		twist_stamped_external_body_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped_external_body", 10);
+	}
+
+	if (params.additional_packets.ecef_position)
+	{
+		pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("pose", 10);
+		pose_stamped_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose_stamped", 10);
+	}
 }
 
 /**
@@ -443,6 +491,18 @@ void Driver::receivePackets(const std::span<const uint8_t> buffer) {
 	decodePackets(an_decoder, buffer_bytes);
 }
 
+	bool Driver::packet_is_recent(uint8_t packet_id, std::chrono::microseconds max_age) {
+		auto now = this->get_clock()->now();
+		auto pkt_it = packet_receive_times.find(packet_id);
+		if (pkt_it == packet_receive_times.end())
+		{
+			return false;
+		}
+		auto packet_time = pkt_it->second;
+
+		return now - packet_time <= rclcpp::Duration(max_age);
+	}
+
 /**
  * @brief Periodic callback for publishing ROS messages.
  *
@@ -457,21 +517,36 @@ void Driver::publishTimerCallback() {
 
 	// Since the messages can be filled in other threads ensure exclusive access.
 	std::unique_lock<std::mutex> lock(messages_mutex_);
+	const auto params = param_listener_->get_params();
 
-	// PUBLISH MESSAGES
-	nav_sat_fix_pub_->publish(nav_fix_msg_);
-	twist_pub_->publish(twist_msg_);
-	twist_stamped_pub_->publish(twist_stamped_msg_);
-	twist_stamped_external_body_pub_->publish(twist_stamped_msg_external_body);
-	imu_pub_->publish(imu_msg_);
-	imu_raw_pub_->publish(imu_raw_msg_);
-	magnetic_field_pub_->publish(mag_field_msg_);
-	barometric_pressure_pub_->publish(baro_msg_);
-	temperature_pub_->publish(temp_msg_);
-	pose_pub_->publish(pose_msg_);
-	pose_stamped_pub_->publish(pose_stamped_msg_);
-	geo_pose_pub_->publish(geo_pose_msg_);
-	geo_pose_stamped_pub_->publish(geo_pose_stamped_msg_);
+	if (packet_is_recent(packet_id_system_state, std::chrono::microseconds(params.publish_us)))
+	{
+		nav_sat_fix_pub_->publish(nav_fix_msg_);
+		twist_pub_->publish(twist_msg_);
+		twist_stamped_pub_->publish(twist_stamped_msg_);
+		imu_pub_->publish(imu_msg_);
+		geo_pose_pub_->publish(geo_pose_msg_);
+		geo_pose_stamped_pub_->publish(geo_pose_stamped_msg_);
+	}
+
+	if (packet_is_recent(packet_id_external_body_velocity, std::chrono::microseconds(params.publish_us)) && twist_stamped_external_body_pub_)
+	{
+		twist_stamped_external_body_pub_->publish(twist_stamped_msg_external_body);
+	}
+
+	if (packet_is_recent(packet_id_raw_sensors, std::chrono::microseconds(params.publish_us)) && imu_raw_pub_ && magnetic_field_pub_ && barometric_pressure_pub_ && temperature_pub_)
+	{
+		imu_raw_pub_->publish(imu_raw_msg_);
+		magnetic_field_pub_->publish(mag_field_msg_);
+		barometric_pressure_pub_->publish(baro_msg_);
+		temperature_pub_->publish(temp_msg_);
+	}
+
+	if (packet_is_recent(packet_id_ecef_position, std::chrono::microseconds(params.publish_us)) && pose_pub_ && pose_stamped_pub_)
+	{
+		pose_pub_->publish(pose_msg_);
+		pose_stamped_pub_->publish(pose_stamped_msg_);
+	}
 }
 
 /**
@@ -699,9 +774,9 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 		const auto gnss_fix = static_cast<GnssFixStatus>(sys_state_pkt->filter_status.b.gnss_fix_type);
 		stat.add("GNSS Fix Status", to_string(gnss_fix));
 
-		if (params.health.gnss_fix && gnss_fix != GnssFixStatus::Fix3D)
+		if (params.health.gnss_fix && (gnss_fix == GnssFixStatus::NoFix || gnss_fix == GnssFixStatus::Fix2D))
 		{
-			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No GNSS 3D Fix");
+			stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No precise GNSS Fix");
 		}
 
 		if (params.health.external_velocity)
@@ -1108,10 +1183,24 @@ std::vector<adnav_interfaces::msg::PacketPeriod> Driver::getPacketRequest() {
 			packet_periods.push_back(period);
 		}
 
-		for (std::size_t i = 0; (i+i) < params.additional_packet_request.size(); i++) {
+		if (params.additional_packets.external_body_velocity) {
 			adnav_interfaces::msg::PacketPeriod period;
-			period.packet_id = params.additional_packet_request[i+i];
-			period.packet_period = params.additional_packet_request[i+i+1];
+			period.packet_id = packet_id_external_body_velocity;
+			period.packet_period = params.default_packet_period;
+			packet_periods.push_back(period);
+		}
+
+		if (params.additional_packets.ecef_position) {
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = packet_id_ecef_position;
+			period.packet_period = params.default_packet_period;
+			packet_periods.push_back(period);
+		}
+
+		if (params.additional_packets.raw_sensors) {
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = packet_id_raw_sensors;
+			period.packet_period = params.default_packet_period;
 			packet_periods.push_back(period);
 		}
 	}
@@ -1512,20 +1601,25 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_euler_orientation_standard_deviation:
 				{
 					euler_orientation_standard_deviation_packet_t pkt;
-					decode_euler_orientation_standard_deviation_packet(&pkt, an_packet);
-					euler_orientation_standard_deviation_packet_ = pkt;
+					if (decode_euler_orientation_standard_deviation_packet(&pkt, an_packet) == 0)
+					{
+						euler_orientation_standard_deviation_packet_ = pkt;
+					}
 					break;
 				}
 
 			case packet_id_velocity_standard_deviation:
 				{
 					velocity_standard_deviation_packet_t pkt;
-					decode_velocity_standard_deviation_packet(&pkt, an_packet);
-					velocity_standard_deviation_packet_ = pkt;
+					if (decode_velocity_standard_deviation_packet(&pkt, an_packet) == 0)
+					{
+						velocity_standard_deviation_packet_ = pkt;
+					}
 					break;
 				}
 
-			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
+			case packet_id_raw_sensors:
+				rawSensorsRosDecoder(an_packet);
 				break;
 
 			case packet_id_body_velocity:
@@ -1536,6 +1630,22 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				extBodyVelRosDecoder(an_packet);
 				break;
 
+			case packet_id_running_time:
+				{
+					running_time_packet_t pkt;
+					if (decode_running_time_packet(&pkt, an_packet) == 0)
+					{
+						auto uptime = duration_from_seconds_microseconds(pkt.seconds, pkt.microseconds);
+						if (device_running_time_ && uptime < *device_running_time_)
+						{
+							RCLCPP_ERROR(this->get_logger(), "Device running time has gone backwards. Previous: %f seconds, Current: %f seconds. This may indicate a device reset or clock issue.",
+								device_running_time_->seconds(), uptime.seconds());
+							close_async_->send();
+						}
+						device_running_time_ = uptime;
+					}
+					break;
+				}
 			default:
 				handled = false;
 				break;
@@ -1588,16 +1698,16 @@ void Driver::deviceInfoDecoder(an_packet_t* an_packet) {
 		diagnostic_updater_->setHardwareID(serial_num.str());
 		device_information_packet_ = device_information_packet;
 	}
+
 	// since multiple packets may be requested before the device responds. ensure only one gets printed per second.
-	RCLCPP_INFO_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Device Information:\n"
-			<< "Device ID: " <<	device_information_packet.device_id <<
-			"\nVersion:" <<
-			"\n  Software: " << device_information_packet.software_version <<
-			"\n  Hardware: " << device_information_packet.hardware_revision <<
-			"\nSerial Number: " << std::hex << device_information_packet.serial_number[0] <<
-				device_information_packet.serial_number[1] << device_information_packet.serial_number[2]
-			<< std::endl
-			);
+	RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "%s",
+		std::format("Device ID: {} - Software Rev: {} - Hardware Rev: {} - Serial Number: {:X}{:X}{:X}",
+			device_information_packet.device_id,
+			device_information_packet.software_version,
+			device_information_packet.hardware_revision,
+			device_information_packet.serial_number[0],
+			device_information_packet.serial_number[1],
+			device_information_packet.serial_number[2]).c_str());
 }
 
         geometry_msgs::msg::Twist transformTwistEnuToFlu(
@@ -1645,7 +1755,8 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	if(decode_system_state_packet(&system_state_packet, an_packet) == 0)
 	 {
 			// NAVSATFIX
-			nav_fix_msg_.header.stamp = time_from_state_packet(system_state_packet);
+			nav_fix_msg_.header.stamp = time_from_seconds_microseconds(system_state_packet.unix_time_seconds,
+				system_state_packet.microseconds);
 			nav_fix_msg_.header.frame_id = frame_id_;
 			if ((system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_2d) ||
 				(system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_3d))
@@ -1807,7 +1918,7 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 
 	// Fill the messages
 	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
-
+		raw_sensors_packet_ = raw_sensors_packet;
 		// RAW MAGNETICFIELD VALUE FROM IMU
 		mag_field_msg_.header.frame_id = frame_id_;
 		mag_field_msg_.magnetic_field.x = raw_sensors_packet.magnetometers[0];
@@ -1830,7 +1941,6 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		// TEMPERATURE
 		temp_msg_.header.frame_id = frame_id_;
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
-
 	}
 }
 

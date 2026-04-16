@@ -20,18 +20,27 @@ adnav:
     type: bool
     default_value: true
     description: "If true, the driver will configure the packet periods overriding the default settings on the device."
-  default_packet_period:
-    type: int
-    default_value: 50
-    description: "Integer value for the default packet send rate period in μs. This will be applied to all packets that are not specified in the additional_packet_request array."
-  additional_packet_request:
-    type: int_array
-    default_value: []
-    description: "Array of additional packet IDs and their corresponding polling frequencies in microseconds. The array should be in the format [packet_id_1, period_1, packet_id_2, period_2, ...]. Supported packet IDs can be found in the AdvancedNavigation documentation."
   override_existing_packets:
     type: bool
     default_value: true
     description: "The existing existing packet ids and periods will be cleared on the device."
+  default_packet_period:
+    type: int
+    default_value: 50
+    description: "Integer value for the default packet send rate period in μs. This will be applied to all packets that are not specified in the additional_packet_request array."
+  additional_packets:
+    external_body_velocity:
+      type: bool
+      default_value: false
+      description: "If true, the driver will request External Body Velocity."
+    ecef_position:
+      type: bool
+      default_value: false
+      description: "If true, the driver will request ECEF Position."
+    raw_sensors:
+      type: bool
+      default_value: false
+      description: "If true, the driver will request Raw Sensors data."
   packet_timer_period:
     type: int
     default_value: 1000
@@ -71,7 +80,7 @@ adnav:
     gnss_fix:
         type: bool
         default_value: true
-        description: "Require a valid 3D GNSS fix for the device to be considered healthy."
+        description: "Require a precise GNSS fix (3D or better) for the device to be considered healthy."
     external_velocity:
       type: bool
       default_value: false

@@ -91,10 +91,10 @@ namespace adnav {
     inline constexpr std::array<uint8_t, 5> REQUIRED_PACKETS = {
         {
             packet_id_system_state,
-            packet_id_raw_sensors,
             packet_id_body_velocity,
             packet_id_euler_orientation_standard_deviation,
             packet_id_velocity_standard_deviation,
+            packet_id_running_time
         }};
 
 constexpr double RADIANS_TO_DEGREES = (180.0/M_PI);
@@ -143,10 +143,12 @@ class Driver : public rclcpp::Node
     adnav::Logger rtcm_logger_;
 
     std::unordered_map<uint8_t, rclcpp::Time> packet_receive_times;
+    std::optional<rclcpp::Duration> device_running_time_;
 
     // ANPP Packet variables
     std::optional<device_information_packet_t> device_information_packet_;
     TimedBox<system_state_packet_t> system_state_packet_;
+    TimedBox<raw_sensors_packet_t> raw_sensors_packet_;
     TimedBox<euler_orientation_standard_deviation_packet_t> euler_orientation_standard_deviation_packet_;
     TimedBox<velocity_standard_deviation_packet_t> velocity_standard_deviation_packet_;
 
@@ -287,6 +289,8 @@ class Driver : public rclcpp::Node
     void rawSensorsRosDecoder(an_packet_t* an_packet);
     void extBodyVelRosDecoder(an_packet_t *an_packet);
     void bodyVelRosDecoder(an_packet_t *an_packet);
+
+    bool packet_is_recent(uint8_t packet_id, std::chrono::microseconds max_age);
 };
 
 }  // namespace adnav
