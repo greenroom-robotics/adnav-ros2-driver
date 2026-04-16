@@ -388,6 +388,11 @@ void Driver::createPublishers() {
 		temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>("temperature", 10);
 	}
 
+	if (params.additional_packets.body_velocity)
+	{
+		twist_stamped_body_velocity_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped_body", 10);
+	}
+
 	if (params.additional_packets.external_body_velocity)
 	{
 		twist_stamped_external_body_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("twist_stamped_external_body", 10);
@@ -527,6 +532,11 @@ void Driver::publishTimerCallback() {
 		imu_pub_->publish(imu_msg_);
 		geo_pose_pub_->publish(geo_pose_msg_);
 		geo_pose_stamped_pub_->publish(geo_pose_stamped_msg_);
+	}
+
+	if (packet_is_recent(packet_id_body_velocity, std::chrono::microseconds(params.publish_us)) && twist_stamped_body_velocity_pub_)
+	{
+		twist_stamped_body_velocity_pub_->publish(twist_stamped_msg_body);
 	}
 
 	if (packet_is_recent(packet_id_external_body_velocity, std::chrono::microseconds(params.publish_us)) && twist_stamped_external_body_pub_)
@@ -1183,6 +1193,13 @@ std::vector<adnav_interfaces::msg::PacketPeriod> Driver::getPacketRequest() {
 			packet_periods.push_back(period);
 		}
 
+		if (params.additional_packets.body_velocity) {
+			adnav_interfaces::msg::PacketPeriod period;
+			period.packet_id = packet_id_body_velocity;
+			period.packet_period = params.default_packet_period;
+			packet_periods.push_back(period);
+		}
+
 		if (params.additional_packets.external_body_velocity) {
 			adnav_interfaces::msg::PacketPeriod period;
 			period.packet_id = packet_id_external_body_velocity;
@@ -1807,16 +1824,14 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 
 			// TWIST
 
-			if (!params.use_body_velocity)
-			{
-				twist_msg_.linear.x = system_state_packet.velocity[0];
-				twist_msg_.linear.y = system_state_packet.velocity[1];
-				twist_msg_.linear.z = system_state_packet.velocity[2];
+			twist_msg_.linear.x = system_state_packet.velocity[0];
+			twist_msg_.linear.y = system_state_packet.velocity[1];
+			twist_msg_.linear.z = system_state_packet.velocity[2];
 
-				if (params.convert_twist_enu_to_flu) {
-					twist_msg_ = transformTwistEnuToFlu(twist_msg_, orientation_);
-				}
+			if (params.convert_twist_enu_to_flu) {
+				twist_msg_ = transformTwistEnuToFlu(twist_msg_, orientation_);
 			}
+
 			twist_msg_.angular.x = system_state_packet.angular_velocity[0];
 			twist_msg_.angular.y = system_state_packet.angular_velocity[1];
 			twist_msg_.angular.z = system_state_packet.angular_velocity[2];
@@ -1826,16 +1841,10 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 
 			// IMU
 			imu_msg_.header = nav_fix_msg_.header;
-
 			imu_msg_.orientation.x = orientation_[0];
 			imu_msg_.orientation.y = orientation_[1];
 			imu_msg_.orientation.z = orientation_[2];
 			imu_msg_.orientation.w = orientation_[3];
-
-			// POSE Orientation
-			pose_msg_.orientation = imu_msg_.orientation;
-			pose_stamped_msg_.pose = pose_msg_;
-			pose_stamped_msg_.header = nav_fix_msg_.header;
 
 			imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[0]; // These the same as the TWIST msg values
 			imu_msg_.angular_velocity.y = system_state_packet.angular_velocity[1];
@@ -1882,6 +1891,11 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 		pose_msg_.position.x = ecef_position_packet.position[0];
 		pose_msg_.position.y = ecef_position_packet.position[1];
 		pose_msg_.position.z = ecef_position_packet.position[2];
+
+		// TODO this borrowing between packets isn't great
+		pose_msg_.orientation = imu_msg_.orientation;
+		pose_stamped_msg_.pose = pose_msg_;
+		pose_stamped_msg_.header = nav_fix_msg_.header;
 	}
 }
 
@@ -1948,23 +1962,30 @@ void Driver::bodyVelRosDecoder(an_packet_t *an_packet)
 {
 	body_velocity_packet_t body_velocity_packet;
 
-	auto stamp_time = this->get_clock().get()->now();
+	const auto stamp_time = this->get_clock().get()->now();
 
 	if (decode_body_velocity_packet(&body_velocity_packet, an_packet) == 0)
 	{
-		twist_msg_.linear.x = body_velocity_packet.velocity[0];
-		twist_msg_.linear.y = -body_velocity_packet.velocity[1];
-		twist_msg_.linear.z = -body_velocity_packet.velocity[2];
-		twist_stamped_msg_.header.stamp = stamp_time;
-		twist_stamped_msg_.header.frame_id = frame_id_;
-		twist_stamped_msg_.twist = twist_msg_;
+		twist_stamped_msg_body.twist.linear.x = body_velocity_packet.velocity[0];
+		twist_stamped_msg_body.twist.linear.y = -body_velocity_packet.velocity[1];
+		twist_stamped_msg_body.twist.linear.z = -body_velocity_packet.velocity[2];
+
+		if (const auto sys_pkt = system_state_packet_.value(); sys_pkt.has_value())
+		{
+			// borrow the angular rates from the system packet
+			twist_stamped_msg_body.twist.angular.x = sys_pkt.value().angular_velocity[0];
+			twist_stamped_msg_body.twist.angular.y = sys_pkt.value().angular_velocity[1];
+			twist_stamped_msg_body.twist.angular.z = sys_pkt.value().angular_velocity[2];
+		}
+		twist_stamped_msg_body.header.stamp = stamp_time;
+		twist_stamped_msg_body.header.frame_id = frame_id_;
 	}
 }
 
 void Driver::extBodyVelRosDecoder(an_packet_t *an_packet)
 {
 	external_body_velocity_packet_t external_body_velocity_packet;
-	auto stamp_time = this->get_clock().get()->now();
+	const auto stamp_time = this->get_clock().get()->now();
 
 	if (decode_external_body_velocity_packet(&external_body_velocity_packet, an_packet) == 0)
 	{

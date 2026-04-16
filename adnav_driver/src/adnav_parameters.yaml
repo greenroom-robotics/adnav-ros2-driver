@@ -1,15 +1,15 @@
 adnav:
-  baud_rate:
-    type: int
-    default_value: 115200
-    description: "Baud rate for serial communication with the Advanced Navigation device"
-    validation:
-      one_of<>: [[2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000, 2000000]]
-  serial_port:
-    type: string
-    default_value: "/dev/ttyUSB0"
-    description: "Serial port for communication with the Advanced Navigation device"
-    read_only: true
+#  baud_rate:
+#    type: int
+#    default_value: 115200
+#    description: "Baud rate for serial communication with the Advanced Navigation device"
+#    validation:
+#      one_of<>: [[2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000, 2000000]]
+#  serial_port:
+#    type: string
+#    default_value: "/dev/ttyUSB0"
+#    description: "Serial port for communication with the Advanced Navigation device"
+#    read_only: true
   publish_us:
     type: int
     default_value: 20000
@@ -29,6 +29,10 @@ adnav:
     default_value: 50
     description: "Integer value for the default packet send rate period in μs. This will be applied to all packets that are not specified in the additional_packet_request array."
   additional_packets:
+    body_velocity:
+      type: bool
+      default_value: false
+      description: "If true, the driver will request Body Velocity."
     external_body_velocity:
       type: bool
       default_value: false
@@ -47,31 +51,27 @@ adnav:
     description: "Integer value for Packet Timing Period in μs"
   connection_type:
     type: string
-    description: "Connection type to the Advanced Navigation device: Can be 'serial', 'tcp-client' or 'udp'"
+    description: "Connection type to the Advanced Navigation device: Can be 'tcp-client' or 'udp'"
     validation:
-      one_of<>: [["serial", "tcp-client", "udp"]]
+      one_of<>: [["tcp-client", "udp"]]
   ip_address:
     type: string
     default_value: ""
-    description: "IP address for communication with the Advanced Navigation device when using Ethernet connection"
+    description: "Address for communication with the Advanced Navigation device when using IP connection"
   port:
     type: int
     default_value: 16718
-    description: "Port for communication with the Advanced Navigation device when using Ethernet connection"
+    description: "Port for communication with the Advanced Navigation device when using IP connection"
     validation:
       bounds<>: [1, 65535]
   convert_twist_enu_to_flu:
     type: bool
-    default_value: false
+    default_value: true
     description: "If true, converts Twist messages from ENU to FLU frame convention."
   log_path:
     type: string
     default_value: "~/.ros/log/"
     description: "Directory path where log files will be stored"
-  use_body_velocity:
-    type: bool
-    default_value: false
-    description: "If true, use body velocity packet data instead of transforming state packet velocity."
   health:
     filters_initialised:
       type: bool

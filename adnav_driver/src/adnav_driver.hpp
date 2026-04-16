@@ -162,6 +162,7 @@ class Driver : public rclcpp::Node
     sensor_msgs::msg::Temperature   temp_msg_;
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::TwistStamped twist_stamped_msg_;
+    geometry_msgs::msg::TwistStamped twist_stamped_msg_body;
     geometry_msgs::msg::TwistStamped twist_stamped_msg_external_body;
     geometry_msgs::msg::PoseStamped pose_stamped_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
@@ -180,6 +181,7 @@ class Driver : public rclcpp::Node
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr 			twist_stamped_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr 			twist_stamped_body_velocity_pub_;
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr 			twist_stamped_external_body_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr 			pose_stamped_pub_;
