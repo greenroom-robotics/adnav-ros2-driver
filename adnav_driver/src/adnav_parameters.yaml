@@ -85,6 +85,10 @@ adnav:
       type: bool
       default_value: false
       description: "Require the External Velocity Active flag, i.e. DVL signal is valid."
+    sensors_in_range:
+      type: bool
+      default_value: true
+      description: "Require no sensor over-range errors."
     thresholds:
       position_accuracy_rms_2d:
           type: double

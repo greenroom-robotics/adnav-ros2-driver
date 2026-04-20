@@ -607,22 +607,6 @@ void Driver::system_status_diagnostic(diagnostic_updater::DiagnosticStatusWrappe
 			stat.add("GNSS", "Fail");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
 		}
-		if (sys_state_pkt->system_status.b.accelerometer_over_range) {
-			stat.add("Accelerometer Over Range", "Fail");
-			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-		}
-		if (sys_state_pkt->system_status.b.gyroscope_over_range) {
-			stat.add("Gyroscope Over Range", "Fail");
-			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-		}
-		if (sys_state_pkt->system_status.b.magnetometer_over_range) {
-			stat.add("Magnetometer", " Over Range");
-			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-		}
-		if (sys_state_pkt->system_status.b.pressure_over_range) {
-			stat.add("Pressure Sensor", " Over Range");
-			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-		}
 		if (sys_state_pkt->system_status.b.minimum_temperature_alarm) {
 			stat.add("Temperature Alarm", "Minimum Temperature Alarm");
 			stat.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
@@ -760,6 +744,27 @@ void Driver::accuracy_diagnostic(diagnostic_updater::DiagnosticStatusWrapper &st
 		const auto params = param_listener_->get_params();
 
 		stat.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
+		stat.add("Accelerometer In Range", sys_state_pkt->system_status.b.accelerometer_over_range ? "Fail" : "OK");
+		stat.add("Gyroscope In Range", sys_state_pkt->system_status.b.gyroscope_over_range ? "Fail" : "OK");
+		stat.add("Magnetometer In Range", sys_state_pkt->system_status.b.magnetometer_over_range ? "Fail" : "OK");
+		stat.add("Pressure Sensor In Range", sys_state_pkt->system_status.b.pressure_over_range ? "Fail" : "OK");
+
+		if (params.health.sensors_in_range)
+		{
+			if (sys_state_pkt->system_status.b.accelerometer_over_range) {
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Accelerometer Over Range");
+			}
+			if (sys_state_pkt->system_status.b.gyroscope_over_range) {
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Gyroscope Over Range");
+			}
+			if (sys_state_pkt->system_status.b.magnetometer_over_range) {
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Magnetometer Over Range");
+			}
+			if (sys_state_pkt->system_status.b.pressure_over_range) {
+				stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Pressure Sensor Over Range");
+			}
+		}
 
 		if (params.health.filters_initialised)
 		{
